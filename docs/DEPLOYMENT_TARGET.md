@@ -11,7 +11,7 @@
 The `auto_video_editor` pipeline is currently designed as a local-first CLI tool. This document proposes a future split-plane architecture where a **web control plane** (Cloudflare Workers + Pages) coordinates work dispatched to a **Python compute plane** (long-running VMs or container workers) that executes FFmpeg, Whisper, and AI inference.
 
 This separation exists because:
-- Cloudflare Standard Workers have a 128 MB memory limit and a 30-second CPU time budget — incompatible with video transcoding or STT inference.
+- Cloudflare Worker CPU and memory limits depend on the current platform plan and configuration. This proposed architecture must not depend on a hard-coded runtime limit. Current limits must be verified from official Cloudflare documentation during the deployment phase.
 - Direct-to-R2 uploads avoid buffering full video files through Worker memory.
 
 ---

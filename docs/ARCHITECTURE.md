@@ -311,7 +311,7 @@ Phase 2 (Content Profile Configuration) may begin ONLY when ALL of the following
 
 | Profile | Duration | Min | Max | Stages | Weight Sum | Weights Valid |
 |---|---|---|---|---|---|---|
-| `food_review` | 45s | — | — | 5 | 100 ✅ | All integers in [0,100] ✅ |
+| `food_review` | 45s | 30s | 60s | 5 | 100 ✅ | All integers in [0,100] ✅ |
 | `lifestyle_vlog` | 45s | 30s | 60s | 5 | 100 ✅ | All integers in [0,100] ✅ |
 | `affiliate_fast` | 40s | 25s | 50s | 5 | 100 ✅ | All integers in [0,100] ✅ |
 

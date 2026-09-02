@@ -72,7 +72,7 @@ python -m unittest discover -s tests -p "test_*.py"
 
 | Profile | Account | Duration | Min | Max |
 |---|---|---|---|---|
-| `food_review` | @luenguynnn | 45s | — | — |
+| `food_review` | @luenguynnn | 45s | 30s | 60s |
 | `lifestyle_vlog` | @_bylue | 45s | 30s | 60s |
 | `affiliate_fast` | @iz_lue | 40s | 25s | 50s |
 

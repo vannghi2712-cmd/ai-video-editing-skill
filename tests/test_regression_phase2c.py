@@ -75,11 +75,15 @@ class TestFoodReviewPreserved(unittest.TestCase):
     def test_reference_duration_is_45(self):
         self.assertEqual(self.profile.reference_duration_seconds, 45)
 
-    def test_no_min_duration(self):
-        self.assertIsNone(self.profile.min_duration_seconds)
+    def test_min_duration_is_30(self):
+        self.assertEqual(self.profile.min_duration_seconds, 30)
 
-    def test_no_max_duration(self):
-        self.assertIsNone(self.profile.max_duration_seconds)
+    def test_max_duration_is_60(self):
+        self.assertEqual(self.profile.max_duration_seconds, 60)
+
+    def test_min_le_default_le_max(self):
+        self.assertLessEqual(self.profile.min_duration_seconds, self.profile.reference_duration_seconds)
+        self.assertLessEqual(self.profile.reference_duration_seconds, self.profile.max_duration_seconds)
 
     def test_account_is_luenguynnn(self):
         self.assertEqual(self.profile.account, "@luenguynnn")

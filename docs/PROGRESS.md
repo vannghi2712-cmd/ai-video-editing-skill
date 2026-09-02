@@ -116,3 +116,33 @@ Tests: 94 discovered, 94 passed, 0 failed, exit 0
 | 8 | Human Review & Render | 🔒 LOCKED |
 
 Each phase requires explicit user authorization before starting.
+
+---
+
+## Phase 2 Final Correction
+
+**Status:** ✅ COMPLETE
+**Previous corrective commit:** `7e5651fc1f7a9b63c89e2aab93da9063bfa67144`
+**Final corrective commit SHA:** recorded in the execution report
+**Date:** 2026-09-02
+
+### Corrections Applied
+
+| Item | Change |
+|---|---|
+| `food_review.min_duration_seconds` | Added: 30 (previously absent) |
+| `food_review.max_duration_seconds` | Added: 60 (previously absent) |
+| `docs/DEPLOYMENT_TARGET.md` | Removed fixed "30-second CPU time budget" claim; replaced with plan-dependent advisory |
+| `docs/PROFILE_GUIDE.md` | Updated food_review table to show min:30, max:60 |
+| `docs/ARCHITECTURE.md` | Updated invariants table food_review row |
+| `README.md` | Updated food_review profile table |
+| `tests/test_regression_phase2c.py` | Updated food_review bounds tests from None → 30/60 |
+
+### Test Count After Final Correction
+```
+Command: .\.venv\Scripts\python.exe -m unittest discover -s tests -p "test_*.py"
+Tests: 178+ discovered, all passed, exit 0
+```
+
+### Phase 3 Status
+Phase 3 remains LOCKED. Explicit user authorization is required before any Phase 3 work begins.

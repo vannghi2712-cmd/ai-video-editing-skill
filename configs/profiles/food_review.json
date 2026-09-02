@@ -6,6 +6,8 @@
   "description": "TikTok food review content for @luenguynnn. 45s target with hook-dish-experience-review-CTA structure.",
   "account": "@luenguynnn",
   "reference_duration_seconds": 45,
+  "min_duration_seconds": 30,
+  "max_duration_seconds": 60,
   "narrative": {
     "stages": [
       {

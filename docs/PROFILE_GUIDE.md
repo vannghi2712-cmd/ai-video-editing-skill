@@ -17,7 +17,7 @@ The profile system provides a **data-driven, account-specific configuration laye
 ```
 configs/profiles/
 ├── base.json           ← Generic defaults (NOT directly usable for editing)
-├── food_review.json    ← @luenguynnn — 45s food review
+├── food_review.json    ← @luenguynnn — 45s food review (min:30, max:60)
 ├── lifestyle_vlog.json ← @_bylue — 45s lifestyle/travel vlog (min:30, max:60)
 └── affiliate_fast.json ← @iz_lue — 40s affiliate product review (min:25, max:50)
 
@@ -92,8 +92,9 @@ Every profile (base and child) must include these top-level fields:
 
 | Field | Value | Classification |
 |---|---|---|
-| Default duration | 45s | REPOSITORY-DERIVED |
-| Min / Max duration | none / none | REPOSITORY-DERIVED |
+| Default duration | 45s | SPECIFIED |
+| Min duration | 30s | SPECIFIED |
+| Max duration | 60s | SPECIFIED |
 | Preprocessing | `normal` | REPOSITORY-DERIVED |
 | BGM volume | 10% | REPOSITORY-DERIVED |
 
