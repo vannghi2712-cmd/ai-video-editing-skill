@@ -204,6 +204,7 @@ def _dict_to_profile(data: dict[str, Any]) -> ContentProfile:
             start_seconds=s["start_seconds"],
             end_seconds=s["end_seconds"],
             description=s.get("description", ""),
+            required=s.get("required", False),
         )
         for s in stages_data
     )
@@ -248,6 +249,8 @@ def _dict_to_profile(data: dict[str, Any]) -> ContentProfile:
         framerate=data.get("framerate", 30),
         codec=codec,
         reference_duration_seconds=data.get("reference_duration_seconds", 60.0),
+        min_duration_seconds=data.get("min_duration_seconds"),
+        max_duration_seconds=data.get("max_duration_seconds"),
         subtitle=subtitle,
         audio=audio,
         narrative_stages=stages,

@@ -21,6 +21,7 @@ class NarrativeStage:
     start_seconds: float
     end_seconds: float
     description: str = ""
+    required: bool = False
 
     @property
     def duration_seconds(self) -> float:
@@ -137,6 +138,8 @@ class ContentProfile:
     framerate: int = 30
     codec: CodecConfig = field(default_factory=CodecConfig)
     reference_duration_seconds: float = 60.0
+    min_duration_seconds: float | None = None
+    max_duration_seconds: float | None = None
     subtitle: SubtitleConfig = field(default_factory=SubtitleConfig)
     audio: AudioConfig = field(default_factory=AudioConfig)
     narrative_stages: tuple[NarrativeStage, ...] = ()
@@ -200,6 +203,7 @@ def _profile_to_dict(profile: ContentProfile) -> dict[str, Any]:
                     "label": s.label,
                     "start_seconds": s.start_seconds,
                     "end_seconds": s.end_seconds,
+                    "required": s.required,
                     "description": s.description,
                 }
                 for s in profile.narrative_stages
@@ -226,6 +230,10 @@ def _profile_to_dict(profile: ContentProfile) -> dict[str, Any]:
         result["account"] = profile.account
     if profile.extends:
         result["extends"] = profile.extends
+    if profile.min_duration_seconds is not None:
+        result["min_duration_seconds"] = profile.min_duration_seconds
+    if profile.max_duration_seconds is not None:
+        result["max_duration_seconds"] = profile.max_duration_seconds
     cg = profile.preprocessing.caption_grouping
     if cg.words_per_group_min is not None:
         result["preprocessing"]["caption_grouping"]["words_per_group_min"] = cg.words_per_group_min

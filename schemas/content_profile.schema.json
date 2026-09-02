@@ -72,6 +72,18 @@
       "exclusiveMinimum": 0,
       "maximum": 600
     },
+    "min_duration_seconds": {
+      "type": "number",
+      "exclusiveMinimum": 0,
+      "maximum": 600,
+      "description": "Minimum acceptable output duration. Must be <= reference_duration_seconds."
+    },
+    "max_duration_seconds": {
+      "type": "number",
+      "exclusiveMinimum": 0,
+      "maximum": 600,
+      "description": "Maximum acceptable output duration. Must be >= reference_duration_seconds."
+    },
     "subtitle": {
       "type": "object",
       "properties": {
@@ -125,6 +137,7 @@
               "label": { "type": "string", "minLength": 1 },
               "start_seconds": { "type": "number", "minimum": 0 },
               "end_seconds": { "type": "number", "minimum": 0 },
+              "required": { "type": "boolean", "description": "Whether this stage is mandatory in the edit plan." },
               "description": { "type": "string" }
             },
             "additionalProperties": false

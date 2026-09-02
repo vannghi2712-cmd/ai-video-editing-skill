@@ -8,6 +8,78 @@
 
 🧑‍💻 by **nyx研究所** — [GitHub](https://github.com/znyupup) · [B站](https://space.bilibili.com/4330525) · [小红书](https://www.xiaohongshu.com/) @nyx研究所 · [X / Twitter](https://x.com/znyupup_music)
 
+---
+
+## `auto_video_editor` — Python Pipeline (Phase 2)
+
+> **Phase 3+ (transcription, scene detection, render) is NOT implemented.**
+> Only the content profile system (load, validate, CLI) is available.
+
+### Requirements
+
+- **Python 3.11+** (tested on 3.11.9 — Microsoft Store build)
+- No external runtime dependencies
+
+### Setup
+
+```powershell
+# Clone and enter the repo
+git clone https://github.com/vannghi2712-cmd/ai-video-editing-skill.git
+cd ai-video-editing-skill
+
+# Create isolated virtual environment
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+
+# Editable install (zero runtime dependencies)
+pip install --editable . --no-deps
+
+# Verify
+python -m auto_video_editor profiles list
+```
+
+### CLI Commands
+
+```powershell
+# List all content profiles (4 columns: ID, Display Name, TikTok Handle, Duration)
+python -m auto_video_editor profiles list
+
+# Show merged JSON for a specific profile
+python -m auto_video_editor profiles show food_review
+python -m auto_video_editor profiles show lifestyle_vlog
+python -m auto_video_editor profiles show affiliate_fast
+
+# Validate a single profile
+python -m auto_video_editor profiles validate food_review
+
+# Validate ALL child profiles (no-arg default or explicit --all)
+python -m auto_video_editor profiles validate
+python -m auto_video_editor profiles validate --all
+```
+
+**Exit codes:** `0` success · `2` usage error · `3` not found/unsafe · `4` validation failure · `5` internal error
+
+### Run Tests
+
+```powershell
+$env:PYTHONPATH = "src"
+python -m unittest discover -s tests -p "test_*.py"
+# OR via venv (PYTHONPATH not required):
+.\.venv\Scripts\python.exe -m unittest discover -s tests -p "test_*.py"
+```
+
+### Content Profiles
+
+| Profile | Account | Duration | Min | Max |
+|---|---|---|---|---|
+| `food_review` | @luenguynnn | 45s | — | — |
+| `lifestyle_vlog` | @_bylue | 45s | 30s | 60s |
+| `affiliate_fast` | @iz_lue | 40s | 25s | 50s |
+
+See [`docs/PROFILE_GUIDE.md`](docs/PROFILE_GUIDE.md) for full schema and business rules.
+
+---
+
 ## ✨ 这是什么
 
 这是一份给 AI Agent（Claude Code / Hermes / OpenClaw / GPT 等）使用的 **Skill 文件**，定义了从原始素材到成品视频的完整自动剪辑工作流。

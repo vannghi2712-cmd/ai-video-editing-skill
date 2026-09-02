@@ -61,6 +61,49 @@
 
 ---
 
+## Phase 2 Correction
+
+**Status:** ✅ COMPLETE
+**Previous commit:** `303fd49e2268c065560614347831da643764eb4d`
+**Corrective commit SHA:** recorded in the Phase 2 execution report
+**Date:** 2026-09-02
+
+### Deviations Found in Previous Phase 2 Output
+
+| Item | Previous (wrong) | Corrected |
+|---|---|---|
+| `lifestyle_vlog` duration | 90s, no min/max | 45s default, min:30, max:60 |
+| `lifestyle_vlog` stage names | cold_open→arrival→exploration→highlight→reflection | cold_open→arrival_or_context→exploration→highlight→reflection_or_closing |
+| `lifestyle_vlog` stage endpoints | 0-5-20-55-75-90 | 0-2-8-27-38-45 |
+| `lifestyle_vlog` weight keys | story, emotion, visual_quality, variety, motion | story_relevance, emotion_and_human_moment, visual_quality, visual_variety, motion_and_transition_potential |
+| `affiliate_fast` duration | 30s, no min/max | 40s default, min:25, max:50 |
+| `affiliate_fast` stage names | hook→problem→demo→proof→cta | result_or_pain_hook→product_context→demonstration→experience_or_evidence→recommendation_and_cta |
+| `affiliate_fast` stage endpoints | 0-3-8-20-26-30 | 0-2-7-22-34-40 |
+| `affiliate_fast` weight keys | hook_strength, demo_value, credibility | hook_and_result_strength, demonstration_value, evidence_and_credibility |
+| CLI `profiles list` | ID only (1 column) | 4 columns: ID, Display Name, Handle, Duration |
+| CLI `profiles validate` no-arg | usage error (required group) | validates ALL child profiles |
+| CLI `profiles validate --all` + `<id>` | not explicitly rejected | exits 2 with mutual-exclusion error |
+| packaging | none | `pyproject.toml`, editable install, `.venv` |
+
+### Corrections Applied
+- `lifestyle_vlog.json` — rewritten to spec
+- `affiliate_fast.json` — rewritten to spec
+- `schemas/content_profile.schema.json` — added `min_duration_seconds`, `max_duration_seconds`, `required` field on stages
+- `src/auto_video_editor/profiles/models.py` — added `min/max_duration_seconds` to `ContentProfile`, `required` to `NarrativeStage`
+- `src/auto_video_editor/profiles/loader.py` — parses new fields
+- `src/auto_video_editor/profiles/validation.py` — validates `min <= default <= max`; updated known keys
+- `src/auto_video_editor/cli.py` — 4-column list; validate no-arg = all; mutual exclusion enforced
+- `pyproject.toml` — added (zero runtime deps, Python >=3.11, src layout)
+- `tests/test_regression_phase2c.py` — regression tests locking all corrected values
+
+### Baseline Before Correction
+```
+Command: python -m unittest discover -s tests -p "test_*.py" (PYTHONPATH=src)
+Tests: 94 discovered, 94 passed, 0 failed, exit 0
+```
+
+---
+
 ## Locked Phases
 
 | Phase | Name | Status |

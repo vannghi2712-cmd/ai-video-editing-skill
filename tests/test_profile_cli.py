@@ -127,14 +127,15 @@ class TestCliProfilesList(unittest.TestCase):
 
     def test_list_excludes_base(self):
         _, out, _ = _run(["profiles", "list"], self.profiles_dir)
-        lines = out.strip().splitlines()
-        self.assertNotIn("base", lines)
+        # base must not appear in any row
+        self.assertNotIn("base", [l.split()[0] for l in out.strip().splitlines() if l.strip()])
 
     def test_list_includes_child_profiles(self):
         _, out, _ = _run(["profiles", "list"], self.profiles_dir)
-        lines = out.strip().splitlines()
-        self.assertIn("alpha_profile", lines)
-        self.assertIn("beta_profile", lines)
+        # Check that rows containing the profile IDs exist (4-column rows, not exact line match)
+        ids_found = [l.split()[0] for l in out.strip().splitlines() if l.strip()]
+        self.assertIn("alpha_profile", ids_found)
+        self.assertIn("beta_profile", ids_found)
 
     def test_list_is_deterministic(self):
         _, out1, _ = _run(["profiles", "list"], self.profiles_dir)
@@ -147,7 +148,7 @@ class TestCliProfilesList(unittest.TestCase):
             self.skipTest("Real profiles dir not found")
         code, out, _ = _run(["profiles", "list"], real_dir)
         self.assertEqual(code, 0)
-        ids = out.strip().splitlines()
+        ids = [l.split()[0] for l in out.strip().splitlines() if l.strip()]
         self.assertIn("food_review", ids)
         self.assertIn("lifestyle_vlog", ids)
         self.assertIn("affiliate_fast", ids)

@@ -60,6 +60,29 @@ def validate_profile(profile: ContentProfile) -> None:
         profile.reference_duration_seconds > 0,
         f"[{pid}] reference_duration_seconds must be > 0, got {profile.reference_duration_seconds}.",
     )
+    # --- Optional min/max bounds ---
+    if profile.min_duration_seconds is not None:
+        _check(
+            profile.min_duration_seconds > 0,
+            f"[{pid}] min_duration_seconds must be > 0, got {profile.min_duration_seconds}.",
+        )
+        _check(
+            profile.min_duration_seconds <= profile.reference_duration_seconds,
+            f"[{pid}] min_duration_seconds ({profile.min_duration_seconds}) must be <= "
+            f"reference_duration_seconds ({profile.reference_duration_seconds}).",
+        )
+    if profile.max_duration_seconds is not None:
+        _check(
+            profile.max_duration_seconds >= profile.reference_duration_seconds,
+            f"[{pid}] max_duration_seconds ({profile.max_duration_seconds}) must be >= "
+            f"reference_duration_seconds ({profile.reference_duration_seconds}).",
+        )
+    if profile.min_duration_seconds is not None and profile.max_duration_seconds is not None:
+        _check(
+            profile.min_duration_seconds <= profile.max_duration_seconds,
+            f"[{pid}] min_duration_seconds ({profile.min_duration_seconds}) must be <= "
+            f"max_duration_seconds ({profile.max_duration_seconds}).",
+        )
 
     # --- Platform / aspect ratio ---
     _check(
@@ -167,8 +190,8 @@ def validate_raw_dict(data: dict[str, Any], profile_id: str) -> None:
     known_keys = {
         "$schema_version", "profile_id", "extends", "display_name", "description",
         "account", "platform", "aspect_ratio", "resolution", "framerate",
-        "codec", "reference_duration_seconds", "subtitle", "audio",
-        "narrative", "scoring", "preprocessing",
+        "codec", "reference_duration_seconds", "min_duration_seconds", "max_duration_seconds",
+        "subtitle", "audio", "narrative", "scoring", "preprocessing",
     }
     unknown = set(data.keys()) - known_keys
     if unknown:

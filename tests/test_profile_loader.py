@@ -257,7 +257,7 @@ class TestRealProfiles(unittest.TestCase):
     def test_lifestyle_vlog_stage_order(self):
         profile = load_profile("lifestyle_vlog", self._get_real_dir())
         names = [s.name for s in profile.narrative_stages]
-        self.assertEqual(names, ["cold_open", "arrival", "exploration", "highlight", "reflection"])
+        self.assertEqual(names, ["cold_open", "arrival_or_context", "exploration", "highlight", "reflection_or_closing"])
 
     def test_lifestyle_vlog_weight_sum(self):
         profile = load_profile("lifestyle_vlog", self._get_real_dir())

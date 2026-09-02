@@ -3,56 +3,63 @@
   "profile_id": "lifestyle_vlog",
   "extends": "base",
   "display_name": "Lifestyle Vlog — @_bylue",
-  "description": "TikTok lifestyle/travel vlog content for @_bylue. Story-driven with preserved ambient sound.",
+  "description": "TikTok lifestyle/travel vlog for @_bylue. Story-driven with authentic moments and ambient audio preserved.",
   "account": "@_bylue",
-  "reference_duration_seconds": 90,
+  "reference_duration_seconds": 45,
+  "min_duration_seconds": 30,
+  "max_duration_seconds": 60,
   "narrative": {
     "stages": [
       {
         "name": "cold_open",
         "label": "Cold Open",
         "start_seconds": 0,
-        "end_seconds": 5,
-        "description": "Cinematic cold open with highlight moment or atmospheric shot"
+        "end_seconds": 2,
+        "required": true,
+        "description": "Cinematic cold open — highlight moment or atmospheric shot to hook the viewer"
       },
       {
-        "name": "arrival",
-        "label": "Arrival",
-        "start_seconds": 5,
-        "end_seconds": 20,
-        "description": "Setting the scene — journey, first impressions, establishing context"
+        "name": "arrival_or_context",
+        "label": "Arrival / Context",
+        "start_seconds": 2,
+        "end_seconds": 8,
+        "required": false,
+        "description": "Setting the scene — journey, arrival, or establishing context"
       },
       {
         "name": "exploration",
         "label": "Exploration",
-        "start_seconds": 20,
-        "end_seconds": 55,
-        "description": "Core content — discovering places, people, activities"
+        "start_seconds": 8,
+        "end_seconds": 27,
+        "required": true,
+        "description": "Core discovery — places, people, activities, authentic moments"
       },
       {
         "name": "highlight",
         "label": "Highlight",
-        "start_seconds": 55,
-        "end_seconds": 75,
-        "description": "Peak moment — best experience, most visual impact"
+        "start_seconds": 27,
+        "end_seconds": 38,
+        "required": true,
+        "description": "Peak experience — the best moment, highest visual or emotional impact"
       },
       {
-        "name": "reflection",
-        "label": "Reflection",
-        "start_seconds": 75,
-        "end_seconds": 90,
+        "name": "reflection_or_closing",
+        "label": "Reflection / Closing",
+        "start_seconds": 38,
+        "end_seconds": 45,
+        "required": false,
         "description": "Emotional wrap-up, personal takeaway, or ambient outro"
       }
     ]
   },
   "scoring": {
     "weights": {
-      "story": 25,
-      "emotion": 20,
+      "story_relevance": 25,
+      "emotion_and_human_moment": 20,
       "visual_quality": 20,
       "technical_quality": 15,
-      "variety": 10,
-      "motion": 10
+      "visual_variety": 10,
+      "motion_and_transition_potential": 10
     }
   },
   "audio": {

@@ -307,13 +307,15 @@ Phase 2 (Content Profile Configuration) may begin ONLY when ALL of the following
 | `docs/PROFILE_GUIDE.md` | Docs | Complete profile system guide |
 | `docs/PROGRESS.md` | Docs | Phase progress log |
 
-### Validated Profile Invariants
+### Validated Profile Invariants (Corrected — Phase 2 Correction Commit)
 
-| Profile | Duration | Stages | Weight Sum | Weights Valid |
-|---|---|---|---|---|
-| `food_review` | 45s | 5 | 100 ✅ | All integers in [0,100] ✅ |
-| `lifestyle_vlog` | 90s | 5 | 100 ✅ | All integers in [0,100] ✅ |
-| `affiliate_fast` | 30s | 5 | 100 ✅ | All integers in [0,100] ✅ |
+| Profile | Duration | Min | Max | Stages | Weight Sum | Weights Valid |
+|---|---|---|---|---|---|---|
+| `food_review` | 45s | — | — | 5 | 100 ✅ | All integers in [0,100] ✅ |
+| `lifestyle_vlog` | 45s | 30s | 60s | 5 | 100 ✅ | All integers in [0,100] ✅ |
+| `affiliate_fast` | 40s | 25s | 50s | 5 | 100 ✅ | All integers in [0,100] ✅ |
+
+> **Note:** Previous Phase 2 commit `303fd49` had `lifestyle_vlog` at 90s (no bounds) and `affiliate_fast` at 30s (no bounds) with incorrect stage names and weight keys. These were corrected in the Phase 2 Correction commit. See `docs/PROGRESS.md` for the full deviation table.
 
 ### Merge Contract (Implemented)
 

@@ -1,14 +1,15 @@
 """CLI implementation for auto_video_editor.
 
 Commands:
-  profiles list                   — list available child profiles (lexicographic)
+  profiles list                   — list available child profiles (4 columns, lexicographic)
   profiles show <profile_id>      — print merged profile JSON to stdout
+  profiles validate               — validate ALL child profiles (no-arg default)
+  profiles validate --all         — alias: validate ALL child profiles
   profiles validate <profile_id>  — validate a single profile
-  profiles validate --all         — validate all child profiles
 
 Exit codes:
   0  success
-  2  usage error
+  2  usage error (bad arguments or mutually exclusive args)
   3  profile not found / unsafe path
   4  parse or validation failure
   5  internal error
@@ -38,17 +39,50 @@ from auto_video_editor.profiles.loader import (
 )
 from auto_video_editor.profiles.validation import validate_profile, validate_profile_from_dict
 
+# Column widths for `profiles list` output
+_COL_ID = 20
+_COL_NAME = 36
+_COL_HANDLE = 16
+_COL_DURATION = 8
+
+
+def _format_list_header() -> str:
+    return (
+        f"{'ID':<{_COL_ID}}  {'Display Name':<{_COL_NAME}}  "
+        f"{'TikTok Handle':<{_COL_HANDLE}}  {'Duration':<{_COL_DURATION}}"
+    )
+
+
+def _format_list_row(profile_id: str, display_name: str, account: str, duration_s: float) -> str:
+    dur_str = f"{int(duration_s)}s"
+    return (
+        f"{profile_id:<{_COL_ID}}  {display_name:<{_COL_NAME}}  "
+        f"{account:<{_COL_HANDLE}}  {dur_str:<{_COL_DURATION}}"
+    )
+
 
 def _cmd_profiles_list(args: argparse.Namespace) -> int:
-    """List all available child profiles, sorted lexicographically."""
+    """List all available child profiles with 4 columns."""
     profiles_dir = Path(args.profiles_dir) if args.profiles_dir else _default_profiles_dir()
     try:
         ids = list_profiles(profiles_dir)
     except Exception as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 5
+
+    sys.stdout.buffer.write((_format_list_header() + "\n").encode("utf-8"))
     for pid in ids:
-        print(pid)
+        try:
+            profile = load_profile(pid, profiles_dir)
+            row = _format_list_row(
+                pid,
+                profile.display_name,
+                profile.account,
+                profile.reference_duration_seconds,
+            )
+        except Exception:
+            row = _format_list_row(pid, "(load error)", "", 0)
+        sys.stdout.buffer.write((row + "\n").encode("utf-8"))
     return 0
 
 
@@ -76,10 +110,27 @@ def _cmd_profiles_show(args: argparse.Namespace) -> int:
 
 
 def _cmd_profiles_validate(args: argparse.Namespace) -> int:
-    """Validate one or all profiles."""
+    """Validate one or all profiles.
+
+    Behavior:
+      profiles validate              → validate ALL (no-arg default)
+      profiles validate --all        → validate ALL (explicit alias)
+      profiles validate <profile_id> → validate ONE profile
+      profiles validate <id> --all   → exit 2 (usage error: mutually exclusive)
+    """
     profiles_dir = Path(args.profiles_dir) if args.profiles_dir else _default_profiles_dir()
 
-    if args.all:
+    # Mutual exclusion check
+    if args.profile_id and args.all:
+        print(
+            "ERROR: profile_id and --all are mutually exclusive. "
+            "Provide one or the other, or neither (to validate all).",
+            file=sys.stderr,
+        )
+        return 2
+
+    # Validate ALL when no profile_id given, or --all given
+    if not args.profile_id or args.all:
         try:
             ids = list_profiles(profiles_dir)
         except Exception as exc:
@@ -97,17 +148,12 @@ def _cmd_profiles_validate(args: argparse.Namespace) -> int:
                 overall_ok = False
         return 0 if overall_ok else 4
     else:
-        if not args.profile_id:
-            print("ERROR: profile_id is required when --all is not specified.", file=sys.stderr)
-            return 2
         ok = _validate_one(args.profile_id, profiles_dir)
         return 0 if ok else 4
 
 
 def _validate_one(profile_id: str, profiles_dir: Path) -> bool:
-    """Validate a single profile. Returns True if valid, False otherwise.
-    Prints result to stdout/stderr.
-    """
+    """Validate a single profile. Returns True if valid, False otherwise."""
     try:
         raw = load_profile_raw(profile_id, profiles_dir)
         validate_profile_from_dict(raw, profile_id)
@@ -149,17 +195,27 @@ def build_parser() -> argparse.ArgumentParser:
     profiles_sub = profiles_parser.add_subparsers(dest="profiles_command", required=True)
 
     # profiles list
-    profiles_sub.add_parser("list", help="List all available child profiles.")
+    profiles_sub.add_parser("list", help="List all available child profiles (4 columns).")
 
     # profiles show <profile_id>
     show_parser = profiles_sub.add_parser("show", help="Show merged profile JSON.")
     show_parser.add_argument("profile_id", help="Profile ID to show.")
 
-    # profiles validate [--all | <profile_id>]
+    # profiles validate [<profile_id>] [--all]
+    # No-arg validates all; --all is an explicit alias; specific ID validates only that ID.
     validate_parser = profiles_sub.add_parser("validate", help="Validate profiles.")
-    validate_group = validate_parser.add_mutually_exclusive_group(required=True)
-    validate_group.add_argument("profile_id", nargs="?", help="Profile ID to validate.")
-    validate_group.add_argument("--all", action="store_true", help="Validate all child profiles.")
+    validate_parser.add_argument(
+        "profile_id",
+        nargs="?",
+        default=None,
+        help="Profile ID to validate (omit to validate all).",
+    )
+    validate_parser.add_argument(
+        "--all",
+        action="store_true",
+        default=False,
+        help="Validate all child profiles (alias for no-arg behavior).",
+    )
 
     return parser
 
@@ -171,7 +227,6 @@ def main(argv: list[str] | None = None) -> int:
     try:
         args = parser.parse_args(argv)
     except SystemExit as exc:
-        # argparse calls sys.exit(2) on parse error
         return int(exc.code) if exc.code is not None else 2
 
     try:
