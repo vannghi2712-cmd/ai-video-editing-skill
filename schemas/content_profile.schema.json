@@ -1,0 +1,184 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "content_profile.schema.json",
+  "title": "Content Profile Schema",
+  "description": "Schema for auto_video_editor content profiles (base and child). Version 1.0.0.",
+  "type": "object",
+  "required": ["$schema_version", "profile_id"],
+  "properties": {
+    "$schema_version": {
+      "type": "string",
+      "const": "1.0.0",
+      "description": "Schema version. Must be 1.0.0."
+    },
+    "profile_id": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9_]{1,63}$",
+      "description": "Unique profile identifier. Lowercase alphanumeric + underscores, 2-64 chars."
+    },
+    "extends": {
+      "type": "string",
+      "const": "base",
+      "description": "Parent profile to inherit from. Only 'base' is valid."
+    },
+    "display_name": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 200
+    },
+    "description": {
+      "type": "string",
+      "maxLength": 1000
+    },
+    "account": {
+      "type": "string",
+      "description": "TikTok account handle (informational only)."
+    },
+    "platform": {
+      "type": "string",
+      "enum": ["tiktok", "youtube_shorts", "instagram_reels"]
+    },
+    "aspect_ratio": {
+      "type": "string",
+      "enum": ["9:16", "16:9", "1:1", "4:5"]
+    },
+    "resolution": {
+      "type": "object",
+      "properties": {
+        "width": { "type": "integer", "minimum": 360, "maximum": 7680 },
+        "height": { "type": "integer", "minimum": 360, "maximum": 7680 }
+      },
+      "additionalProperties": false
+    },
+    "framerate": {
+      "type": "integer",
+      "enum": [24, 25, 30, 60]
+    },
+    "codec": {
+      "type": "object",
+      "properties": {
+        "video": { "type": "string" },
+        "audio": { "type": "string" },
+        "pixel_format": { "type": "string" },
+        "crf": { "type": "integer", "minimum": 0, "maximum": 51 },
+        "audio_bitrate_kbps": { "type": "integer", "minimum": 32, "maximum": 512 },
+        "audio_sample_rate": { "type": "integer" },
+        "audio_channels": { "type": "integer", "minimum": 1, "maximum": 8 }
+      },
+      "additionalProperties": false
+    },
+    "reference_duration_seconds": {
+      "type": "number",
+      "exclusiveMinimum": 0,
+      "maximum": 600
+    },
+    "subtitle": {
+      "type": "object",
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "format": { "type": "string", "enum": ["ass", "srt"] },
+        "safe_zone": {
+          "type": "object",
+          "properties": {
+            "top_percent": { "type": "number", "minimum": 0, "maximum": 50 },
+            "bottom_percent": { "type": "number", "minimum": 0, "maximum": 50 },
+            "left_percent": { "type": "number", "minimum": 0, "maximum": 50 },
+            "right_percent": { "type": "number", "minimum": 0, "maximum": 50 }
+          },
+          "additionalProperties": false
+        },
+        "font": {
+          "type": "object",
+          "properties": {
+            "family": { "type": "string" },
+            "size": { "type": "integer", "minimum": 8, "maximum": 200 },
+            "bold": { "type": "boolean" },
+            "color_hex": { "type": "string", "pattern": "^#[0-9A-Fa-f]{6}$" },
+            "outline_color_hex": { "type": "string", "pattern": "^#[0-9A-Fa-f]{6}$" },
+            "outline_width": { "type": "number", "minimum": 0, "maximum": 10 }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "audio": {
+      "type": "object",
+      "properties": {
+        "normalize_speech": { "type": "boolean" },
+        "bgm_volume_percent": { "type": "number", "minimum": 0, "maximum": 100 },
+        "duck_bgm_under_speech": { "type": "boolean" },
+        "preserve_ambient": { "type": "boolean" }
+      },
+      "additionalProperties": false
+    },
+    "narrative": {
+      "type": "object",
+      "properties": {
+        "stages": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["name", "label", "start_seconds", "end_seconds"],
+            "properties": {
+              "name": { "type": "string", "pattern": "^[a-z][a-z0-9_]{0,63}$" },
+              "label": { "type": "string", "minLength": 1 },
+              "start_seconds": { "type": "number", "minimum": 0 },
+              "end_seconds": { "type": "number", "minimum": 0 },
+              "description": { "type": "string" }
+            },
+            "additionalProperties": false
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "scoring": {
+      "type": "object",
+      "properties": {
+        "weights": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 100
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "preprocessing": {
+      "type": "object",
+      "properties": {
+        "mode": { "type": "string", "enum": ["strict", "normal", "loose"] },
+        "remove_recording_cues": { "type": "boolean" },
+        "remove_filler_words": { "type": "boolean" },
+        "remove_configured_pauses": { "type": "boolean" },
+        "hallucination_volume_threshold_db": { "type": "number", "maximum": 0 },
+        "caption_grouping": {
+          "type": "object",
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "words_per_group": { "type": "integer", "minimum": 1, "maximum": 20 },
+            "words_per_group_min": { "type": "integer", "minimum": 1, "maximum": 20 },
+            "words_per_group_max": { "type": "integer", "minimum": 1, "maximum": 20 }
+          },
+          "additionalProperties": false
+        },
+        "punch_in": {
+          "type": "object",
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "keywords": {
+              "type": "array",
+              "items": { "type": "string" }
+            }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}

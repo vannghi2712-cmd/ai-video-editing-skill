@@ -1,0 +1,67 @@
+{
+  "$schema_version": "1.0.0",
+  "profile_id": "food_review",
+  "extends": "base",
+  "display_name": "Food Review — @luenguynnn",
+  "description": "TikTok food review content for @luenguynnn. 45s target with hook-dish-experience-review-CTA structure.",
+  "account": "@luenguynnn",
+  "reference_duration_seconds": 45,
+  "narrative": {
+    "stages": [
+      {
+        "name": "visual_hook",
+        "label": "Visual Hook",
+        "start_seconds": 0,
+        "end_seconds": 2,
+        "description": "Eye-catching food or atmosphere shot to stop scrolling"
+      },
+      {
+        "name": "location_or_main_dish",
+        "label": "Location / Main Dish",
+        "start_seconds": 2,
+        "end_seconds": 6,
+        "description": "Establish location context or reveal the featured dish"
+      },
+      {
+        "name": "experience",
+        "label": "Experience",
+        "start_seconds": 6,
+        "end_seconds": 25,
+        "description": "Eating experience, reactions, textures, and flavors"
+      },
+      {
+        "name": "review",
+        "label": "Review",
+        "start_seconds": 25,
+        "end_seconds": 38,
+        "description": "Honest review with verdict and specific praise or critique"
+      },
+      {
+        "name": "cta",
+        "label": "Call to Action",
+        "start_seconds": 38,
+        "end_seconds": 45,
+        "description": "Follow prompt, location tag, or engagement question"
+      }
+    ]
+  },
+  "scoring": {
+    "weights": {
+      "food_appeal": 25,
+      "visibility": 20,
+      "motion": 15,
+      "technical_quality": 15,
+      "composition": 10,
+      "narrative": 10,
+      "emotion": 5
+    }
+  },
+  "audio": {
+    "bgm_volume_percent": 10
+  },
+  "subtitle": {
+    "font": {
+      "size": 44
+    }
+  }
+}

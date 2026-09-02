@@ -1,0 +1,65 @@
+{
+  "$schema_version": "1.0.0",
+  "profile_id": "lifestyle_vlog",
+  "extends": "base",
+  "display_name": "Lifestyle Vlog — @_bylue",
+  "description": "TikTok lifestyle/travel vlog content for @_bylue. Story-driven with preserved ambient sound.",
+  "account": "@_bylue",
+  "reference_duration_seconds": 90,
+  "narrative": {
+    "stages": [
+      {
+        "name": "cold_open",
+        "label": "Cold Open",
+        "start_seconds": 0,
+        "end_seconds": 5,
+        "description": "Cinematic cold open with highlight moment or atmospheric shot"
+      },
+      {
+        "name": "arrival",
+        "label": "Arrival",
+        "start_seconds": 5,
+        "end_seconds": 20,
+        "description": "Setting the scene — journey, first impressions, establishing context"
+      },
+      {
+        "name": "exploration",
+        "label": "Exploration",
+        "start_seconds": 20,
+        "end_seconds": 55,
+        "description": "Core content — discovering places, people, activities"
+      },
+      {
+        "name": "highlight",
+        "label": "Highlight",
+        "start_seconds": 55,
+        "end_seconds": 75,
+        "description": "Peak moment — best experience, most visual impact"
+      },
+      {
+        "name": "reflection",
+        "label": "Reflection",
+        "start_seconds": 75,
+        "end_seconds": 90,
+        "description": "Emotional wrap-up, personal takeaway, or ambient outro"
+      }
+    ]
+  },
+  "scoring": {
+    "weights": {
+      "story": 25,
+      "emotion": 20,
+      "visual_quality": 20,
+      "technical_quality": 15,
+      "variety": 10,
+      "motion": 10
+    }
+  },
+  "audio": {
+    "bgm_volume_percent": 15,
+    "preserve_ambient": true
+  },
+  "preprocessing": {
+    "mode": "loose"
+  }
+}

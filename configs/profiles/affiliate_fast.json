@@ -1,0 +1,82 @@
+{
+  "$schema_version": "1.0.0",
+  "profile_id": "affiliate_fast",
+  "extends": "base",
+  "display_name": "Affiliate Fast — @iz_lue",
+  "description": "TikTok fast-paced affiliate/product review for @iz_lue. Talking head with rapid cuts.",
+  "account": "@iz_lue",
+  "reference_duration_seconds": 30,
+  "narrative": {
+    "stages": [
+      {
+        "name": "hook",
+        "label": "Hook",
+        "start_seconds": 0,
+        "end_seconds": 3,
+        "description": "Attention-grabbing question or bold claim about the product"
+      },
+      {
+        "name": "problem",
+        "label": "Problem",
+        "start_seconds": 3,
+        "end_seconds": 8,
+        "description": "Relatable pain point the product solves"
+      },
+      {
+        "name": "demo",
+        "label": "Demo",
+        "start_seconds": 8,
+        "end_seconds": 20,
+        "description": "Product demonstration with close-ups and results"
+      },
+      {
+        "name": "proof",
+        "label": "Proof / Social Proof",
+        "start_seconds": 20,
+        "end_seconds": 26,
+        "description": "Credibility — before/after, stats, or testimonial"
+      },
+      {
+        "name": "cta",
+        "label": "Call to Action",
+        "start_seconds": 26,
+        "end_seconds": 30,
+        "description": "Direct purchase prompt with link or code reference"
+      }
+    ]
+  },
+  "scoring": {
+    "weights": {
+      "hook_strength": 25,
+      "speech_clarity": 20,
+      "product_visibility": 20,
+      "demo_value": 15,
+      "credibility": 10,
+      "technical_quality": 10
+    }
+  },
+  "audio": {
+    "bgm_volume_percent": 8,
+    "duck_bgm_under_speech": true
+  },
+  "preprocessing": {
+    "mode": "strict",
+    "remove_filler_words": true,
+    "remove_configured_pauses": true,
+    "caption_grouping": {
+      "enabled": true,
+      "words_per_group_min": 2,
+      "words_per_group_max": 5
+    },
+    "punch_in": {
+      "enabled": true,
+      "keywords": ["sản phẩm", "giá", "mua ngay", "link", "giảm giá", "khuyến mãi", "chất lượng"]
+    }
+  },
+  "subtitle": {
+    "font": {
+      "size": 48,
+      "bold": true
+    }
+  }
+}

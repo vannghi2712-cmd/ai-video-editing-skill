@@ -1,0 +1,65 @@
+{
+  "$schema_version": "1.0.0",
+  "profile_id": "base",
+  "display_name": "Base Profile (Generic Defaults)",
+  "description": "Generic defaults inherited by all content profiles. NOT directly usable for editing.",
+  "platform": "tiktok",
+  "aspect_ratio": "9:16",
+  "resolution": {
+    "width": 1080,
+    "height": 1920
+  },
+  "framerate": 30,
+  "codec": {
+    "video": "libx264",
+    "audio": "aac",
+    "pixel_format": "yuv420p",
+    "crf": 18,
+    "audio_bitrate_kbps": 128,
+    "audio_sample_rate": 44100,
+    "audio_channels": 2
+  },
+  "reference_duration_seconds": 60,
+  "subtitle": {
+    "enabled": true,
+    "format": "ass",
+    "safe_zone": {
+      "top_percent": 15,
+      "bottom_percent": 20,
+      "left_percent": 5,
+      "right_percent": 5
+    },
+    "font": {
+      "family": "Arial",
+      "size": 42,
+      "bold": true,
+      "color_hex": "#FFFFFF",
+      "outline_color_hex": "#000000",
+      "outline_width": 2
+    }
+  },
+  "audio": {
+    "normalize_speech": true,
+    "bgm_volume_percent": 12,
+    "duck_bgm_under_speech": true
+  },
+  "narrative": {
+    "stages": []
+  },
+  "scoring": {
+    "weights": {}
+  },
+  "preprocessing": {
+    "mode": "normal",
+    "remove_recording_cues": true,
+    "hallucination_volume_threshold_db": -40,
+    "caption_grouping": {
+      "enabled": false,
+      "words_per_group": 4
+    },
+    "punch_in": {
+      "enabled": false,
+      "keywords": []
+    }
+  }
+}
