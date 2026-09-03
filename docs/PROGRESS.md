@@ -144,5 +144,51 @@ Command: .\.venv\Scripts\python.exe -m unittest discover -s tests -p "test_*.py"
 Tests: 178+ discovered, all passed, exit 0
 ```
 
-### Phase 3 Status
-Phase 3 remains LOCKED. Explicit user authorization is required before any Phase 3 work begins.
+---
+
+## Phase 3 — CPU-first Vietnamese Transcription Pipeline
+
+**Status:** ✅ COMPLETE
+**Date:** 2026-09-03
+
+### What Was Implemented
+
+| Component | Description |
+|---|---|
+| `src/auto_video_editor/transcription/` | Python package — config, models, cache, exporters, service, media |
+| `src/auto_video_editor/transcription/backends/` | Protocol + WhisperX adapter (lazy imports) |
+| `src/auto_video_editor/transcription/cli_commands.py` | `transcribe doctor` and `transcribe run` |
+| `src/auto_video_editor/cli.py` | Updated to route `transcribe` subcommand |
+| `tests/test_transcription.py` | 50 unit tests (no ML deps required) |
+| `docs/PHASE_3_DEPENDENCY_AUDIT.md` | Verified dependency compatibility matrix |
+| `docs/TRANSCRIPTION_GUIDE.md` | User guide for setup and CLI usage |
+| `requirements/transcription-windows-cpu.lock.txt` | Exact resolved lock for reproducibility |
+| `pyproject.toml` | Added `[project.optional-dependencies] transcription` |
+| `.gitignore` | Added `.venv-whisperx/`, `model-cache/`, `.transcription-cache/`, `transcription-output/` |
+
+### Key Contracts Enforced
+
+- Language: Vietnamese (`vi`) only — other languages rejected at config
+- Device: CPU only — `cuda` rejected at config and CLI
+- Diarization: disabled by policy
+- Translation: disabled by policy
+- Word timing: only `timing_status="aligned"` when backend provides genuine timestamps
+- Source integrity: SHA-256 before and after processing must match
+- Cache: content-addressed, manifest ownership tracked
+
+### Test Count After Phase 3
+
+```
+Base .venv:
+  Command: .\.venv\Scripts\python.exe -m unittest discover -s tests -p "test_*.py"
+  Tests: 229 (179 Phase 2 + 50 Phase 3), all passed, exit 0
+
+ML .venv-whisperx:
+  Same discover command — all tests pass, exit 0
+```
+
+### Phase 4 Status
+
+Phase 4 (Vision API, scene scoring, edit planning, FFmpeg rendering, CapCut, video-use,
+Cloudflare deployment) is **NOT implemented**.
+Explicit user authorization is required before Phase 4 begins.

@@ -12,6 +12,16 @@ license = { text = "MIT" }
 authors = [{ name = "Van Nghi Nguyen", email = "vannghi2712@gmail.com" }]
 dependencies = []
 
+# Optional transcription dependencies — install in .venv-whisperx ONLY.
+# NOT part of the mandatory base runtime. See requirements/transcription-windows-cpu.lock.txt.
+[project.optional-dependencies]
+transcription = [
+    "whisperx==3.8.6",
+]
+dev = [
+    "pytest",
+]
+
 [project.scripts]
 auto-video-editor = "auto_video_editor.cli:main"
 

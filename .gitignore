@@ -40,3 +40,13 @@ qc_frames/
 .claude/
 skills/
 skills-lock.json
+
+# Phase 3 — ML environment and caches (never commit)
+.venv-whisperx/
+model-cache/
+.transcription-cache/
+transcription-output/
+
+# Python compiled artifacts (nested)
+**/__pycache__/
+**/*.pyc

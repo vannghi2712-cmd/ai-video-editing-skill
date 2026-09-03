@@ -217,6 +217,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="Validate all child profiles (alias for no-arg behavior).",
     )
 
+    # --- transcribe (Phase 3) — ML deps are lazy-loaded ---
+    from auto_video_editor.transcription.cli_commands import register_transcribe_commands  # noqa: PLC0415
+    register_transcribe_commands(subparsers)
+
     return parser
 
 
@@ -237,6 +241,12 @@ def main(argv: list[str] | None = None) -> int:
                 return _cmd_profiles_show(args)
             elif args.profiles_command == "validate":
                 return _cmd_profiles_validate(args)
+
+        if args.command == "transcribe":
+            # Dispatch to transcribe sub-subcommand (func set by register_transcribe_commands)
+            func = getattr(args, "func", None)
+            if func is not None:
+                return func(args)
 
         print(f"ERROR: Unknown command {args.command!r}", file=sys.stderr)
         return 2
