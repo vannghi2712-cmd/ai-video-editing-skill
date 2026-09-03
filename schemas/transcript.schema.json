@@ -1,0 +1,374 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/vannghi2712-cmd/ai-video-editing-skill/schemas/transcript.schema.json",
+  "title": "Transcript",
+  "description": "Phase 3 transcript output schema v1.0.0. Draft 2020-12.",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "source",
+    "engine",
+    "request",
+    "segments",
+    "alignment",
+    "metrics",
+    "provenance"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "const": "1.0.0"
+    },
+    "source": {
+      "type": "object",
+      "required": [
+        "path",
+        "sha256",
+        "duration_seconds",
+        "size_bytes"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "path": {
+          "type": "string",
+          "minLength": 1
+        },
+        "sha256": {
+          "type": "string",
+          "pattern": "^[0-9A-Fa-f]{64}$"
+        },
+        "duration_seconds": {
+          "type": "number",
+          "exclusiveMinimum": 0
+        },
+        "size_bytes": {
+          "type": "integer",
+          "minimum": 1
+        }
+      }
+    },
+    "engine": {
+      "type": "object",
+      "required": [
+        "name",
+        "version",
+        "asr_model",
+        "device",
+        "compute_type"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "version": {
+          "type": "string"
+        },
+        "asr_model": {
+          "type": "string"
+        },
+        "device": {
+          "type": "string",
+          "enum": [
+            "cpu"
+          ]
+        },
+        "compute_type": {
+          "type": "string",
+          "enum": [
+            "int8",
+            "float32",
+            "float16"
+          ]
+        }
+      }
+    },
+    "request": {
+      "type": "object",
+      "required": [
+        "language",
+        "task",
+        "device",
+        "compute_type",
+        "model",
+        "batch_size",
+        "alignment_mode",
+        "diarization"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "language": {
+          "type": "string"
+        },
+        "task": {
+          "type": "string"
+        },
+        "device": {
+          "type": "string"
+        },
+        "compute_type": {
+          "type": "string"
+        },
+        "model": {
+          "type": "string"
+        },
+        "batch_size": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "alignment_mode": {
+          "type": "string",
+          "enum": [
+            "auto",
+            "on",
+            "off"
+          ]
+        },
+        "diarization": {
+          "type": "boolean",
+          "const": false
+        }
+      }
+    },
+    "segments": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "start",
+          "end",
+          "text",
+          "words"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "start": {
+            "type": "number",
+            "minimum": 0
+          },
+          "end": {
+            "type": "number",
+            "minimum": 0
+          },
+          "text": {
+            "type": "string"
+          },
+          "words": {
+            "type": "array",
+            "items": {
+              "$ref": "#/$defs/word"
+            }
+          }
+        }
+      }
+    },
+    "alignment": {
+      "type": "object",
+      "required": [
+        "requested_mode",
+        "actual_status"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "requested_mode": {
+          "type": "string",
+          "enum": [
+            "auto",
+            "on",
+            "off"
+          ]
+        },
+        "actual_status": {
+          "type": "string",
+          "enum": [
+            "aligned",
+            "unaligned",
+            "skipped",
+            "failed"
+          ]
+        },
+        "model_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "model_fingerprint": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "words_total": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "words_aligned": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        }
+      }
+    },
+    "metrics": {
+      "type": "object",
+      "required": [
+        "asr_elapsed_seconds",
+        "align_elapsed_seconds",
+        "total_elapsed_seconds",
+        "segment_count",
+        "word_count"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "asr_elapsed_seconds": {
+          "type": "number",
+          "minimum": 0
+        },
+        "align_elapsed_seconds": {
+          "type": "number",
+          "minimum": 0
+        },
+        "total_elapsed_seconds": {
+          "type": "number",
+          "minimum": 0
+        },
+        "realtime_factor": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "segment_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "word_count": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "provenance": {
+      "type": "object",
+      "required": [
+        "adapter_version",
+        "schema_version",
+        "whisperx_version",
+        "job_id"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "adapter_version": {
+          "type": "string"
+        },
+        "schema_version": {
+          "type": "string"
+        },
+        "whisperx_version": {
+          "type": "string"
+        },
+        "job_id": {
+          "type": "string"
+        },
+        "alignment_model_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "asr_model_identity": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "alignment_model_identity": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "cache_reuse_enabled": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        }
+      }
+    }
+  },
+  "$defs": {
+    "word": {
+      "type": "object",
+      "required": [
+        "word",
+        "timing_status"
+      ],
+      "additionalProperties": false,
+      "description": "aligned words MUST have start+end; unaligned/failed MUST NOT.",
+      "properties": {
+        "word": {
+          "type": "string"
+        },
+        "timing_status": {
+          "type": "string",
+          "enum": [
+            "aligned",
+            "unaligned",
+            "failed"
+          ]
+        },
+        "score": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "start": {
+          "type": "number",
+          "minimum": 0
+        },
+        "end": {
+          "type": "number",
+          "minimum": 0
+        }
+      },
+      "if": {
+        "properties": {
+          "timing_status": {
+            "const": "aligned"
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "start",
+          "end"
+        ]
+      },
+      "else": {
+        "not": {
+          "anyOf": [
+            {
+              "required": [
+                "start"
+              ]
+            },
+            {
+              "required": [
+                "end"
+              ]
+            }
+          ]
+        }
+      }
+    }
+  }
+}

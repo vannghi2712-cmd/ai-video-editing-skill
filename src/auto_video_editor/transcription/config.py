@@ -16,7 +16,7 @@ SUPPORTED_TASKS: frozenset[str] = frozenset({"transcribe"})
 SUPPORTED_DEVICES: frozenset[str] = frozenset({"cpu"})
 SUPPORTED_COMPUTE_TYPES: frozenset[str] = frozenset({"int8", "float32", "float16"})
 SUPPORTED_ALIGNMENT_MODES: frozenset[str] = frozenset({"auto", "on", "off"})
-DEFAULT_MODEL = "base"
+DEFAULT_MODEL = "small"   # production default; use "tiny" only for smoke tests
 DEFAULT_BATCH_SIZE = 4
 
 
@@ -25,7 +25,7 @@ class TranscriptionConfig:
     """Immutable, validated transcription request config.
 
     All defaults reflect the Phase 3 contract:
-      language=vi, task=transcribe, device=cpu, compute_type=int8.
+      language=vi, task=transcribe, device=cpu, compute_type=int8, model=small.
     """
 
     language: str = "vi"
@@ -37,6 +37,7 @@ class TranscriptionConfig:
     alignment_mode: str = "auto"
     diarization: bool = False
     force: bool = False
+    include_raw: bool = False  # If True, write transcript.raw.json to output dir
 
     # ── post-init validation ─────────────────────────────────────────────
     def __post_init__(self) -> None:  # noqa: D105

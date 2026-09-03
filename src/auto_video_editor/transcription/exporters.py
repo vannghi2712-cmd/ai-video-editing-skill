@@ -10,6 +10,7 @@ Word-timing honesty contract:
 from __future__ import annotations
 
 import json
+import math
 from typing import Any
 
 from auto_video_editor.transcription.models import (
@@ -105,32 +106,56 @@ def export_words_json(result: TranscriptResult) -> str:
 
 # ── Transcript JSON export ────────────────────────────────────────────────────
 
-def _word_to_dict(w: TranscriptWord, seg_start: float, seg_end: float) -> dict:
+def _word_to_dict(w: TranscriptWord) -> dict:
+    """Serialize a word. aligned words include start/end; others MUST NOT."""
     d: dict[str, Any] = {
-        "text": w.text,
+        "word": w.text,
         "timing_status": w.timing_status,
-        "segment_start": seg_start,
-        "segment_end": seg_end,
     }
     if w.timing_status == "aligned":
+        # Verify timestamps are finite before emitting — NEVER emit NaN/Infinity
+        if w.start is None or w.end is None:
+            raise ValueError(
+                f"aligned word {w.text!r} is missing start/end timestamps"
+            )
+        if not (math.isfinite(w.start) and math.isfinite(w.end)):
+            raise ValueError(
+                f"aligned word {w.text!r} has non-finite timestamps: "
+                f"start={w.start}, end={w.end}"
+            )
         d["start"] = w.start
         d["end"] = w.end
         if w.score is not None:
+            if not math.isfinite(w.score):
+                raise ValueError(
+                    f"word {w.text!r} has non-finite score: {w.score}"
+                )
             d["score"] = w.score
     return d
 
 
 def _seg_to_dict(seg: TranscriptSegment) -> dict:
+    if not (math.isfinite(seg.start) and math.isfinite(seg.end)):
+        raise ValueError(
+            f"segment has non-finite timestamps: start={seg.start}, end={seg.end}"
+        )
     return {
         "start": seg.start,
         "end": seg.end,
         "text": seg.text,
-        "words": [_word_to_dict(w, seg.start, seg.end) for w in seg.words],
+        "words": [_word_to_dict(w) for w in seg.words],
     }
 
 
 def export_transcript_json(result: TranscriptResult) -> str:
-    """Generate the canonical transcript.json (schema v1.0.0)."""
+    """
+    Generate the canonical transcript.json (schema v1.0.0).
+
+    Strict JSON: serialized with allow_nan=False to reject NaN/Infinity.
+    Schema parity: segments are at root level (no result wrapper).
+    """
+    import math as _math  # noqa: PLC0415 — re-import for clarity in this scope
+
     doc = {
         "schema_version": result.schema_version,
         "source": {
@@ -147,10 +172,7 @@ def export_transcript_json(result: TranscriptResult) -> str:
             "compute_type": result.engine.compute_type,
         },
         "request": result.request,
-        "result": {
-            "segments": [_seg_to_dict(s) for s in result.segments],
-            "full_text": result.full_text,
-        },
+        "segments": [_seg_to_dict(s) for s in result.segments],
         "alignment": {
             "requested_mode": result.alignment.requested_mode,
             "actual_status": result.alignment.actual_status,
@@ -158,17 +180,17 @@ def export_transcript_json(result: TranscriptResult) -> str:
             "model_fingerprint": result.alignment.model_fingerprint,
             "words_total": result.alignment.words_total,
             "words_aligned": result.alignment.words_aligned,
-            "coverage_fraction": result.alignment.coverage_fraction,
         },
         "metrics": result.metrics,
         "provenance": result.provenance,
     }
-    return json.dumps(doc, ensure_ascii=False, indent=2)
+    # Strict serialization: NaN and Infinity are forbidden by JSON spec (RFC 8259)
+    return json.dumps(doc, ensure_ascii=False, indent=2, allow_nan=False)
 
 
 def export_raw_json(raw_asr_result: Any) -> str:
     """Serialize the raw backend output as-is (transcript.raw.json)."""
     try:
-        return json.dumps(raw_asr_result, ensure_ascii=False, indent=2)
+        return json.dumps(raw_asr_result, ensure_ascii=False, indent=2, allow_nan=False)
     except (TypeError, ValueError):
         return json.dumps({"error": "raw result is not JSON-serializable"}, indent=2)

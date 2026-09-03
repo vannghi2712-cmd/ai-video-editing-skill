@@ -7,13 +7,14 @@ adapter's lazy import mechanism.
 from __future__ import annotations
 
 import json
+import math
 import os
 import time
 from pathlib import Path
 from typing import Optional
 
 from auto_video_editor.transcription import ADAPTER_VERSION, SCHEMA_VERSION
-from auto_video_editor.transcription.backends import BackendUnavailableError
+from auto_video_editor.transcription.backends import BackendRuntimeError, BackendUnavailableError
 from auto_video_editor.transcription.backends.whisperx_backend import WhisperXBackend
 from auto_video_editor.transcription.cache import (
     ALL_ARTIFACT_FILES,
@@ -46,6 +47,9 @@ from auto_video_editor.transcription.models import (
 DEFAULT_CACHE_DIR = ".transcription-cache"
 DEFAULT_MODEL_CACHE_DIR = "model-cache"
 
+# Sentinel used when immutable identity cannot be established
+_UNRESOLVED_SENTINEL = "IDENTITY_UNRESOLVED"
+
 
 class TranscriptionService:
     """
@@ -53,11 +57,12 @@ class TranscriptionService:
 
     Steps:
     1. Probe and validate source media
-    2. Check content-addressed cache (unless --force)
-    3. If cache miss: run backend (ASR + alignment)
-    4. Export all output artifacts atomically
-    5. Write outputs to user-specified output_dir
-    6. Verify source file integrity after processing
+    2. Resolve immutable model identities (disables cache if unresolved)
+    3. Check content-addressed cache (unless --force)
+    4. If cache miss: run backend (ASR + alignment)
+    5. Export all output artifacts atomically
+    6. Write outputs to user-specified output_dir
+    7. Verify source file integrity after processing
     """
 
     def __init__(
@@ -86,31 +91,43 @@ class TranscriptionService:
           MediaProbeError: if source is invalid
           BackendUnavailableError: if ML deps not installed
           BackendRuntimeError: if transcription fails
-          ValueError: output dir ownership conflict
+          ValueError: output dir ownership conflict or alignment strict failure
         """
         out = Path(output_dir).resolve()
 
         # 1. Probe source
         probe = probe_media(source)
 
-        # 2. Compute pre-run identity (model fingerprints may be string hashes
-        #    before download; will be updated to file hashes post-download)
+        # 2. Resolve immutable model identities
         wx_version = _safe_backend_version(self._backend)
-        asr_fp_pre, align_fp_pre = self._backend.model_fingerprints(
-            config, self._model_cache_dir
+        asr_identity, align_identity, cache_reuse_enabled = (
+            self._backend.model_fingerprints(config, self._model_cache_dir)
         )
+
+        if not cache_reuse_enabled:
+            import sys  # noqa: PLC0415
+            print(
+                "WARNING: immutable model identity could not be established "
+                "(models not yet downloaded or unknown model ID). "
+                "Cache read/write is DISABLED for this run.",
+                file=sys.stderr,
+            )
+            # Use a run-specific sentinel so entries are never reused
+            asr_identity = _UNRESOLVED_SENTINEL
+            align_identity = _UNRESOLVED_SENTINEL
+
         identity = CacheIdentity(
             source_sha256=probe.sha256,
             normalized_config=config.as_normalized_dict(),
             schema_version=SCHEMA_VERSION,
             adapter_version=ADAPTER_VERSION,
             whisperx_version=wx_version,
-            asr_model_fingerprint=asr_fp_pre,
-            alignment_model_fingerprint=align_fp_pre,
+            asr_model_fingerprint=asr_identity,
+            alignment_model_fingerprint=align_identity,
         )
 
-        # 3. Check cache (skip if --force)
-        if not config.force:
+        # 3. Check cache (only if identity is fully resolved and not forced)
+        if cache_reuse_enabled and not config.force:
             cached = self._cache.get(identity)
             if cached is not None:
                 TranscriptCache.validate_output_dir_ownership(out, identity)
@@ -120,13 +137,13 @@ class TranscriptionService:
                     "job_id": identity.job_id(),
                     "output_dir": str(out),
                 }
-        else:
+        elif config.force:
             # Force: validate ownership even when bypassing cache read
             if out.exists() and any(out.iterdir()):
                 TranscriptCache.validate_output_dir_ownership(out, identity)
 
         # 4. Validate output dir ownership before committing any I/O
-        if not config.force:
+        if cache_reuse_enabled and not config.force:
             TranscriptCache.validate_output_dir_ownership(out, identity)
 
         # 5. Run ASR
@@ -144,7 +161,7 @@ class TranscriptionService:
             )
         else:
             # No alignment requested — build unaligned segments directly
-            from auto_video_editor.transcription.backends.whisperx_backend import (
+            from auto_video_editor.transcription.backends.whisperx_backend import (  # noqa: PLC0415
                 _build_unaligned_segments,
             )
             typed_segments = _build_unaligned_segments(raw_segments)
@@ -155,21 +172,17 @@ class TranscriptionService:
         align_elapsed = time.monotonic() - t1
         total_elapsed = time.monotonic() - t0
 
-        # 7. Recompute model fingerprints now that models are cached on disk
-        asr_fp_post, align_fp_post = self._backend.model_fingerprints(
-            config, self._model_cache_dir
-        )
-        # Rebuild identity with post-download fingerprints if they changed
-        if asr_fp_post != asr_fp_pre or align_fp_post != align_fp_pre:
-            identity = CacheIdentity(
-                source_sha256=probe.sha256,
-                normalized_config=config.as_normalized_dict(),
-                schema_version=SCHEMA_VERSION,
-                adapter_version=ADAPTER_VERSION,
-                whisperx_version=wx_version,
-                asr_model_fingerprint=asr_fp_post,
-                alignment_model_fingerprint=align_fp_post,
-            )
+        # 7. Strict alignment-on enforcement
+        #    --alignment on requires at least one genuinely aligned word.
+        if config.alignment_mode == "on":
+            aligned = alignment_info.words_aligned or 0
+            if alignment_info.actual_status != "aligned" or aligned < 1:
+                raise BackendRuntimeError(
+                    f"--alignment on requires at least one genuinely aligned word. "
+                    f"Got alignment_status={alignment_info.actual_status!r}, "
+                    f"words_aligned={aligned}. "
+                    "Do NOT downgrade to segment-only or cache partial results."
+                )
 
         # 8. Build typed result
         engine_info = EngineInfo(
@@ -208,34 +221,56 @@ class TranscriptionService:
                 "whisperx_version": wx_version,
                 "job_id": identity.job_id(),
                 "alignment_model_id": alignment_info.model_id,
+                "asr_model_identity": asr_identity if cache_reuse_enabled else None,
+                "alignment_model_identity": align_identity if cache_reuse_enabled else None,
+                "cache_reuse_enabled": cache_reuse_enabled,
             },
         )
 
-        # 9. Serialize all artifacts
+        # 9. Serialize artifacts — raw is NEVER included by default
         transcript_json = export_transcript_json(result)
         srt = export_srt(result)
         words_json = export_words_json(result)
-        raw_json = export_raw_json(raw_segments)
 
         artifacts = {
             TRANSCRIPT_FILE: transcript_json,
             SRT_FILE: srt,
             WORDS_FILE: words_json,
-            TRANSCRIPT_RAW_FILE: raw_json,
         }
 
-        # 10. Write to cache (atomic)
-        manifest = self._cache.put(
-            identity,
-            artifacts,
-            str(probe.path),
-            probe.duration_seconds,
-        )
+        # 10. Write to cache (only when identity is resolved)
+        if cache_reuse_enabled:
+            manifest = self._cache.put(
+                identity,
+                artifacts,
+                str(probe.path),
+                probe.duration_seconds,
+            )
+            # Populate output from cache
+            cached_entry = self._cache.get(identity)
+            if cached_entry:
+                TranscriptCache.populate_output_dir(out, cached_entry)
+        else:
+            # No cache — write directly to output dir
+            out.mkdir(parents=True, exist_ok=True)
+            manifest = {
+                "schema_version": SCHEMA_VERSION,
+                "job_id": identity.job_id(),
+                "cache_reuse_enabled": False,
+            }
+            for fname, content in artifacts.items():
+                data = content.encode("utf-8") if isinstance(content, str) else content
+                _write_atomic(out / fname, data)
+            _write_atomic(
+                out / MANIFEST_FILE,
+                json.dumps(manifest, ensure_ascii=False, indent=2).encode("utf-8"),
+            )
 
-        # 11. Populate output directory from cache
-        cached_entry = self._cache.get(identity)
-        if cached_entry:
-            TranscriptCache.populate_output_dir(out, cached_entry)
+        # 11. Optionally write raw backend response (--include-raw only)
+        if config.include_raw:
+            raw_json = export_raw_json(raw_segments)
+            data = raw_json.encode("utf-8") if isinstance(raw_json, str) else raw_json
+            _write_atomic(out / TRANSCRIPT_RAW_FILE, data)
 
         # 12. Verify source integrity after ALL processing
         verify_source_integrity(probe)
@@ -249,6 +284,7 @@ class TranscriptionService:
             "words_aligned": alignment_info.words_aligned,
             "words_total": alignment_info.words_total,
             "manifest": manifest,
+            "cache_reuse_enabled": cache_reuse_enabled,
         }
 
 

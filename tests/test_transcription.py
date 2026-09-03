@@ -358,10 +358,12 @@ class TestTranscriptJSONExport(unittest.TestCase):
         self.assertIn("requested_mode", doc["alignment"])
         self.assertIn("actual_status", doc["alignment"])
 
-    def test_full_text_in_result(self):
+    def test_segments_at_root_level(self):
+        """schema parity: segments MUST be at root, NOT nested in result{}."""
         r = _make_result()
         doc = json.loads(export_transcript_json(r))
-        self.assertIn("full_text", doc["result"])
+        self.assertIn("segments", doc)
+        self.assertNotIn("result", doc)
 
     def test_unaligned_words_no_timing_in_json(self):
         seg = TranscriptSegment(
@@ -370,10 +372,26 @@ class TestTranscriptJSONExport(unittest.TestCase):
         )
         r = _make_result(segments=(seg,))
         doc = json.loads(export_transcript_json(r))
-        word = doc["result"]["segments"][0]["words"][0]
+        word = doc["segments"][0]["words"][0]
         self.assertEqual(word["timing_status"], "unaligned")
         self.assertNotIn("start", word)
         self.assertNotIn("end", word)
+
+    def test_word_key_is_word_not_text(self):
+        """Words in transcript.json use 'word' key per schema."""
+        r = _make_result()
+        doc = json.loads(export_transcript_json(r))
+        word = doc["segments"][0]["words"][0]
+        self.assertIn("word", word)
+        self.assertNotIn("text", word)
+
+    def test_no_segment_start_end_in_transcript_words(self):
+        """Words in transcript.json must NOT include segment_start/segment_end (additionalProperties:false)."""
+        r = _make_result()
+        doc = json.loads(export_transcript_json(r))
+        word = doc["segments"][0]["words"][0]
+        self.assertNotIn("segment_start", word)
+        self.assertNotIn("segment_end", word)
 
 
 # ── Cache tests ────────────────────────────────────────────────────────────────
@@ -433,10 +451,10 @@ class TestTranscriptCacheRoundtrip(unittest.TestCase):
         return self.cache.put(
             self.identity,
             {
+                # Raw is NOT in ALL_ARTIFACT_FILES — it is opt-in only
                 "transcript.json": json.dumps({"schema_version": "1.0.0", "data": "test"}),
                 "transcript.srt": "1\n00:00:00,000 --> 00:00:02,000\nxin chào\n\n",
                 "words.json": "[]",
-                "transcript.raw.json": "{}",
             },
             source_path="/test/sample.wav",
             duration_seconds=10.0,
@@ -467,7 +485,7 @@ class TestTranscriptCacheRoundtrip(unittest.TestCase):
                 "artifact_files": list(),
             }), encoding="utf-8"
         )
-        for f in ["transcript.srt", "words.json", "transcript.raw.json"]:
+        for f in ["transcript.srt", "words.json"]:
             (entry_dir / f).write_text("", encoding="utf-8")
         result = self.cache.get(self.identity)
         self.assertIsNone(result)
@@ -508,6 +526,23 @@ class TestTranscriptCacheRoundtrip(unittest.TestCase):
             _write_atomic(dest, b"hello world")
             self.assertEqual(dest.read_bytes(), b"hello world")
 
+    def test_raw_file_not_in_all_artifact_files(self):
+        """transcript.raw.json MUST NOT be in ALL_ARTIFACT_FILES (privacy-safe default)."""
+        from auto_video_editor.transcription.cache import ALL_ARTIFACT_FILES, TRANSCRIPT_RAW_FILE  # noqa: PLC0415
+        self.assertNotIn(TRANSCRIPT_RAW_FILE, ALL_ARTIFACT_FILES)
+
+    def test_cache_does_not_restore_raw_by_default(self):
+        """Cache round-trip must NOT restore transcript.raw.json."""
+        self._put()
+        result = self.cache.get(self.identity)
+        self.assertIsNotNone(result)
+        with tempfile.TemporaryDirectory() as outdir:
+            out = Path(outdir)
+            TranscriptCache.populate_output_dir(out, result)
+            raw_path = out / "transcript.raw.json"
+            self.assertFalse(raw_path.exists(),
+                "transcript.raw.json MUST NOT be restored by default (privacy-safe)")
+
 
 # ── Doctor CLI tests (base env) ────────────────────────────────────────────────
 
@@ -516,7 +551,7 @@ class TestDoctorBase(unittest.TestCase):
 
     def test_doctor_exits_3_in_base_env(self):
         """In base .venv, doctor must exit 3 without a traceback. MOCKED_TEST"""
-        import subprocess
+        import subprocess  # noqa: PLC0415
         result = subprocess.run(
             [sys.executable, "-m", "auto_video_editor", "transcribe", "doctor"],
             capture_output=True,
@@ -530,9 +565,24 @@ class TestDoctorBase(unittest.TestCase):
         stderr = result.stderr.decode("utf-8", errors="replace")
         self.assertNotIn("Traceback (most recent call last)", stderr)
 
+    def test_doctor_reports_ready_or_ready_with_warnings(self):
+        """If doctor exits 0 it must report READY or READY_WITH_WARNINGS."""
+        import subprocess  # noqa: PLC0415
+        result = subprocess.run(
+            [sys.executable, "-m", "auto_video_editor", "transcribe", "doctor"],
+            capture_output=True,
+            cwd=str(Path(__file__).parent.parent),
+        )
+        if result.returncode == 0:
+            stdout = result.stdout.decode("utf-8", errors="replace")
+            self.assertTrue(
+                "READY" in stdout or "READY_WITH_WARNINGS" in stdout,
+                f"Exit 0 but status not READY: {stdout[:200]}"
+            )
+
     def test_run_cuda_rejected(self):
         """--device cuda must be rejected at CLI level."""
-        import subprocess
+        import subprocess  # noqa: PLC0415
         result = subprocess.run(
             [sys.executable, "-m", "auto_video_editor", "transcribe", "run",
              "/fake/path.wav", "--output-dir", "/fake/out", "--device", "cuda"],
@@ -543,7 +593,7 @@ class TestDoctorBase(unittest.TestCase):
 
     def test_run_diarize_rejected(self):
         """--diarize must be rejected."""
-        import subprocess
+        import subprocess  # noqa: PLC0415
         result = subprocess.run(
             [sys.executable, "-m", "auto_video_editor", "transcribe", "run",
              "/fake/path.wav", "--output-dir", "/fake/out", "--diarize"],
@@ -554,7 +604,7 @@ class TestDoctorBase(unittest.TestCase):
 
     def test_run_nonexistent_file(self):
         """transcribe run on a non-existent file must fail gracefully."""
-        import subprocess
+        import subprocess  # noqa: PLC0415
         result = subprocess.run(
             [sys.executable, "-m", "auto_video_editor", "transcribe", "run",
              "C:/does/not/exist.wav", "--output-dir", "/tmp/fake"],
@@ -564,8 +614,240 @@ class TestDoctorBase(unittest.TestCase):
         # Should not produce traceback (exit 3 or 4 are both OK for missing dep/file)
         stderr = result.stderr.decode("utf-8", errors="replace")
         # Should not have an unhandled traceback reaching the top level
-        # (it's OK to have one in the error message, but not an INTERNAL ERROR)
         self.assertNotIn("INTERNAL ERROR", stderr)
+
+
+# ── Regression tests (Phase 3 Final Contract Correction) ──────────────────────
+
+class TestProductionDefaults(unittest.TestCase):
+    """Verify production defaults match the Phase 3 contract."""
+
+    def test_default_model_is_small(self):
+        """Production default ASR model MUST be 'small', not 'base'."""
+        from auto_video_editor.transcription.config import DEFAULT_MODEL  # noqa: PLC0415
+        self.assertEqual(DEFAULT_MODEL, "small",
+            "Production default must be 'small'. Use 'tiny' for smoke tests only.")
+
+    def test_config_default_model_is_small(self):
+        c = TranscriptionConfig()
+        self.assertEqual(c.model, "small")
+
+    def test_include_raw_defaults_false(self):
+        """include_raw MUST default to False (privacy-safe)."""
+        c = TranscriptionConfig()
+        self.assertFalse(c.include_raw)
+
+    def test_include_raw_can_be_enabled(self):
+        c = TranscriptionConfig(include_raw=True)
+        self.assertTrue(c.include_raw)
+
+    def test_normalized_dict_excludes_force_and_include_raw(self):
+        """force and include_raw are not part of the cache key."""
+        c1 = TranscriptionConfig(force=True, include_raw=True)
+        c2 = TranscriptionConfig(force=False, include_raw=False)
+        self.assertEqual(c1.as_normalized_dict(), c2.as_normalized_dict())
+
+
+class TestStrictJSON(unittest.TestCase):
+    """Strict JSON serialization: NaN/Infinity must be rejected."""
+
+    def _make_word_nan_start(self) -> TranscriptWord:
+        # Bypass TranscriptWord validation to inject NaN
+        import dataclasses  # noqa: PLC0415
+        w = object.__new__(TranscriptWord)
+        object.__setattr__(w, "text", "nan_word")
+        object.__setattr__(w, "timing_status", "aligned")
+        object.__setattr__(w, "start", float("nan"))
+        object.__setattr__(w, "end", 1.0)
+        object.__setattr__(w, "score", None)
+        return w
+
+    def test_nan_start_raises_in_export(self):
+        """export_transcript_json must raise when a word has NaN start."""
+        w = self._make_word_nan_start()
+        seg = TranscriptSegment(start=0.0, end=2.0, text="test", words=(w,))
+        r = _make_result(segments=(seg,))
+        with self.assertRaises((ValueError, TypeError)):
+            export_transcript_json(r)
+
+    def test_infinity_end_raises_in_export(self):
+        """export_transcript_json must raise when a word has Infinity end."""
+        import dataclasses  # noqa: PLC0415
+        w = object.__new__(TranscriptWord)
+        object.__setattr__(w, "text", "inf_word")
+        object.__setattr__(w, "timing_status", "aligned")
+        object.__setattr__(w, "start", 0.0)
+        object.__setattr__(w, "end", float("inf"))
+        object.__setattr__(w, "score", None)
+        seg = TranscriptSegment(start=0.0, end=2.0, text="test", words=(w,))
+        r = _make_result(segments=(seg,))
+        with self.assertRaises((ValueError, TypeError)):
+            export_transcript_json(r)
+
+    def test_allow_nan_false_in_json_dump(self):
+        """Verify json.dumps with allow_nan=False rejects NaN at python level."""
+        import json as _json  # noqa: PLC0415
+        with self.assertRaises((ValueError,)):
+            _json.dumps(float("nan"), allow_nan=False)
+
+    def test_allow_nan_false_rejects_infinity(self):
+        import json as _json  # noqa: PLC0415
+        with self.assertRaises((ValueError,)):
+            _json.dumps(float("inf"), allow_nan=False)
+
+    def test_valid_transcript_json_parses_without_nan(self):
+        """Normal transcript must serialize and parse cleanly."""
+        r = _make_result()
+        txt = export_transcript_json(r)
+        doc = json.loads(txt)
+        self.assertEqual(doc["schema_version"], "1.0.0")
+
+
+class TestTimingHonesty(unittest.TestCase):
+    """Word timing honesty: aligned words must have timestamps, others must not."""
+
+    def test_aligned_word_must_have_start_and_end(self):
+        """aligned word without start/end raises at model level."""
+        with self.assertRaises(ValueError):
+            TranscriptWord(text="xin", timing_status="aligned")
+
+    def test_unaligned_word_rejects_timestamps(self):
+        """unaligned word with start/end is invalid."""
+        with self.assertRaises(ValueError):
+            TranscriptWord(text="xin", timing_status="unaligned", start=0.0, end=1.0)
+
+    def test_failed_word_rejects_timestamps(self):
+        """failed word with start/end is invalid."""
+        with self.assertRaises(ValueError):
+            TranscriptWord(text="xin", timing_status="failed", start=0.0, end=1.0)
+
+    def test_aligned_word_exporter_validates_finite(self):
+        """Exporter must raise when aligned word has non-finite timestamp."""
+        from auto_video_editor.transcription.exporters import _word_to_dict  # noqa: PLC0415
+        w = object.__new__(TranscriptWord)
+        object.__setattr__(w, "text", "bad")
+        object.__setattr__(w, "timing_status", "aligned")
+        object.__setattr__(w, "start", float("nan"))
+        object.__setattr__(w, "end", 1.0)
+        object.__setattr__(w, "score", None)
+        with self.assertRaises(ValueError):
+            _word_to_dict(w)
+
+    def test_unaligned_word_in_json_has_no_timestamps(self):
+        """Unaligned words in transcript.json MUST NOT have start/end."""
+        seg = TranscriptSegment(
+            start=0.0, end=2.0, text="test",
+            words=(TranscriptWord(text="test", timing_status="unaligned"),)
+        )
+        r = _make_result(segments=(seg,))
+        doc = json.loads(export_transcript_json(r))
+        w = doc["segments"][0]["words"][0]
+        self.assertNotIn("start", w)
+        self.assertNotIn("end", w)
+
+
+class TestImmutableModelIdentity(unittest.TestCase):
+    """Tests for the immutable model identity system."""
+
+    def test_known_revision_tiny(self):
+        """tiny model must return immutable HF revision."""
+        from auto_video_editor.transcription.backends.whisperx_backend import (  # noqa: PLC0415
+            _immutable_model_identity, _KNOWN_HF_REVISIONS
+        )
+        identity, resolved = _immutable_model_identity(
+            "Systran/faster-whisper-tiny", "/fake/cache", "asr"
+        )
+        self.assertTrue(resolved, "Known model must be resolved")
+        self.assertTrue(identity.startswith("hf:Systran/faster-whisper-tiny@"))
+        rev = _KNOWN_HF_REVISIONS["Systran/faster-whisper-tiny"]
+        self.assertIn(rev, identity)
+
+    def test_known_revision_small(self):
+        """small model must return immutable HF revision."""
+        from auto_video_editor.transcription.backends.whisperx_backend import (  # noqa: PLC0415
+            _immutable_model_identity, _KNOWN_HF_REVISIONS
+        )
+        identity, resolved = _immutable_model_identity(
+            "Systran/faster-whisper-small", "/fake/cache", "asr"
+        )
+        self.assertTrue(resolved)
+        self.assertIn(_KNOWN_HF_REVISIONS["Systran/faster-whisper-small"], identity)
+
+    def test_known_revision_vi_alignment(self):
+        """Vietnamese alignment model must return immutable HF revision."""
+        from auto_video_editor.transcription.backends.whisperx_backend import (  # noqa: PLC0415
+            _immutable_model_identity, _KNOWN_HF_REVISIONS
+        )
+        model_id = "nguyenvulebinh/wav2vec2-base-vi-vlsp2020"
+        identity, resolved = _immutable_model_identity(model_id, "/fake/cache", "align")
+        self.assertTrue(resolved)
+        self.assertIn(_KNOWN_HF_REVISIONS[model_id], identity)
+
+    def test_identity_never_uses_name_based_hash(self):
+        """Identity string must start with 'hf:' or 'model-artifact-sha256-v1:' — never a bare hex hash."""
+        from auto_video_editor.transcription.backends.whisperx_backend import (  # noqa: PLC0415
+            _immutable_model_identity
+        )
+        identity, resolved = _immutable_model_identity(
+            "Systran/faster-whisper-tiny", "/fake/cache", "asr"
+        )
+        if resolved:
+            self.assertTrue(
+                identity.startswith("hf:") or identity.startswith("model-artifact-sha256-v1:"),
+                f"Identity must use hf: or model-artifact-sha256-v1: prefix, got: {identity[:60]}"
+            )
+
+    def test_resolve_asr_hf_id_tiny(self):
+        from auto_video_editor.transcription.backends.whisperx_backend import _resolve_asr_hf_id  # noqa: PLC0415
+        self.assertEqual(_resolve_asr_hf_id("tiny"), "Systran/faster-whisper-tiny")
+        self.assertEqual(_resolve_asr_hf_id("small"), "Systran/faster-whisper-small")
+
+    def test_unresolved_identity_returns_empty(self):
+        """Unknown model with no cache returns ('', False)."""
+        from auto_video_editor.transcription.backends.whisperx_backend import _immutable_model_identity  # noqa: PLC0415
+        with tempfile.TemporaryDirectory() as d:
+            identity, resolved = _immutable_model_identity(
+                "unknown/totally-fake-model-xyz", d, "asr"
+            )
+        self.assertFalse(resolved)
+        self.assertEqual(identity, "")
+
+
+class TestSchemaFile(unittest.TestCase):
+    """Verify schemas/transcript.schema.json exists and is valid JSON."""
+
+    def _schema_path(self) -> Path:
+        return Path(__file__).parent.parent / "schemas" / "transcript.schema.json"
+
+    def test_schema_file_exists(self):
+        self.assertTrue(self._schema_path().exists(),
+            "schemas/transcript.schema.json must exist")
+
+    def test_schema_is_valid_json(self):
+        with open(self._schema_path(), encoding="utf-8") as f:
+            schema = json.load(f)
+        self.assertIn("$schema", schema)
+        self.assertIn("$id", schema)
+        self.assertEqual(schema.get("properties", {}).get("schema_version", {}).get("const"), "1.0.0")
+
+    def test_schema_uses_draft_2020_12(self):
+        with open(self._schema_path(), encoding="utf-8") as f:
+            schema = json.load(f)
+        self.assertIn("2020-12", schema["$schema"])
+
+    def test_schema_word_if_then_else_present(self):
+        """Word must use if/then/else for timing_status enforcement."""
+        with open(self._schema_path(), encoding="utf-8") as f:
+            schema = json.load(f)
+        word_def = schema["$defs"]["word"]
+        self.assertIn("if", word_def)
+        self.assertIn("then", word_def)
+        self.assertIn("else", word_def)
+
+    def test_root_has_additional_properties_false(self):
+        with open(self._schema_path(), encoding="utf-8") as f:
+            schema = json.load(f)
+        self.assertFalse(schema.get("additionalProperties", True))
 
 
 if __name__ == "__main__":

@@ -78,25 +78,29 @@ class WhisperXBackend:
         self,
         config: TranscriptionConfig,
         model_cache_dir: str,
-    ) -> tuple[str, str]:
+    ) -> tuple[str, str, bool]:
         """
-        Return (asr_fingerprint, alignment_fingerprint).
+        Return (asr_identity, alignment_identity, cache_reuse_enabled).
 
-        Computes local file fingerprints if models are cached; otherwise
-        uses a hash of the model name string to produce a stable non-UNVERIFIED
-        fingerprint.
+        Identity is ALWAYS an immutable string:
+          - Preferred: hf:{model_id}@{commit_sha}  (from known revisions or local ref)
+          - Fallback:  model-artifact-sha256-v1:{hash}:{file_count}  (full local scan)
+          - If neither is resolvable: returns ("", "", False) → caller disables cache
+
+        NEVER returns a name-based truncated hash or "UNVERIFIED".
         """
-        # ASR model fingerprint
-        asr_fingerprint = _model_fingerprint(
-            config.model, model_cache_dir, "asr"
+        asr_hf_id = _resolve_asr_hf_id(config.model)
+        asr_identity, asr_ok = _immutable_model_identity(
+            asr_hf_id, model_cache_dir, "asr"
         )
 
-        # Alignment model fingerprint — discover the model ID first
         align_model_id = _discover_alignment_model_id(config.language)
-        alignment_fingerprint = _model_fingerprint(
+        align_identity, align_ok = _immutable_model_identity(
             align_model_id, model_cache_dir, "align"
         )
-        return asr_fingerprint, alignment_fingerprint
+
+        cache_reuse_enabled = asr_ok and align_ok
+        return asr_identity, align_identity, cache_reuse_enabled
 
     def get_alignment_model_id(self, language: str) -> str:
         """Return the alignment model ID for the given language."""
@@ -262,6 +266,106 @@ def _model_fingerprint(model_id: str, cache_dir: str, kind: str) -> str:
     uniquely identifies the model weights being used.
     """
     return hashlib.sha256(model_id.encode("utf-8")).hexdigest()[:16]
+
+
+# ── Immutable model identity (replaces name-based hashes) ──────────────────────
+
+# Immutable HF commit SHAs, resolved via huggingface_hub.model_info() on
+# 2026-09-03 — source: LIVE_HF_API (model_info().sha).
+_KNOWN_HF_REVISIONS: dict[str, str] = {
+    "Systran/faster-whisper-tiny":    "d90ca5fe260221311c53c58e660288d3deb8d356",
+    "Systran/faster-whisper-small":   "536b0662742c02347bc0e980a01041f333bce120",
+    "nguyenvulebinh/wav2vec2-base-vi-vlsp2020": "50a30dadb3ec98a0d4cdb1eb1ea315aff538f7c2",
+}
+
+# Mapping from whisperx short model name → HuggingFace repository ID
+_ASR_MODEL_HF_IDS: dict[str, str] = {
+    "tiny":     "Systran/faster-whisper-tiny",
+    "tiny.en":  "Systran/faster-whisper-tiny.en",
+    "base":     "Systran/faster-whisper-base",
+    "base.en":  "Systran/faster-whisper-base.en",
+    "small":    "Systran/faster-whisper-small",
+    "small.en": "Systran/faster-whisper-small.en",
+    "medium":   "Systran/faster-whisper-medium",
+    "large-v2": "Systran/faster-whisper-large-v2",
+    "large-v3": "Systran/faster-whisper-large-v3",
+}
+
+
+def _resolve_asr_hf_id(model_size: str) -> str:
+    """Map short model name (e.g. 'tiny') to full HF model ID."""
+    return _ASR_MODEL_HF_IDS.get(model_size, f"Systran/faster-whisper-{model_size}")
+
+
+def _immutable_model_identity(
+    model_id: str,
+    cache_dir: str,
+    kind: str,
+) -> tuple[str, bool]:
+    """
+    Return (identity_string, is_immutable).
+
+    Priority:
+    1. Hardcoded known commit SHA (fastest; offline-safe)
+    2. Local HF Hub refs/main file (set during model download)
+    3. Full local artifact fingerprint (hash all inference files)
+    4. Unresolved → ("", False) — caller must disable cache
+
+    NEVER uses sha256(model_name)[:N] or "UNVERIFIED".
+    """
+    # Priority 1: hardcoded known immutable revision
+    rev = _KNOWN_HF_REVISIONS.get(model_id)
+    if rev:
+        return f"hf:{model_id}@{rev}", True
+
+    # Priority 2: local HF Hub refs/main (present after any `huggingface_hub` download)
+    safe_id = model_id.replace("/", "--")
+    ref_path = Path(cache_dir) / kind / f"models--{safe_id}" / "refs" / "main"
+    if ref_path.exists():
+        try:
+            sha = ref_path.read_text(encoding="utf-8").strip()
+            if sha and len(sha) >= 40 and all(c in "0123456789abcdefABCDEF" for c in sha[:40]):
+                return f"hf:{model_id}@{sha[:40]}", True
+        except OSError:
+            pass
+
+    # Priority 3: local artifact fingerprint
+    # Hash all inference-relevant files in HF Hub snapshot directory
+    snap_root = Path(cache_dir) / kind / f"models--{safe_id}" / "snapshots"
+    if snap_root.exists():
+        try:
+            identity, file_count = _artifact_fingerprint(snap_root)
+            if file_count > 0:
+                return f"model-artifact-sha256-v1:{identity}:{file_count}", True
+        except Exception:
+            pass
+
+    # Priority 4: unresolved — disable cache
+    return "", False
+
+
+def _artifact_fingerprint(snap_root: Path) -> tuple[str, int]:
+    """
+    Hash all inference-relevant files under snap_root.
+
+    Returns (hex_digest, file_count). Covers weights, config, tokenizer, vocab.
+    """
+    INFERENCE_EXTENSIONS = {
+        ".bin", ".pt", ".safetensors", ".onnx",
+        ".json", ".txt", ".model", ".tiktoken",
+    }
+    h = hashlib.sha256()
+    file_count = 0
+    # Sort for determinism across OS/filesystem orderings
+    for f in sorted(snap_root.rglob("*")):
+        if f.is_file() and f.suffix in INFERENCE_EXTENSIONS:
+            # Include relative path in hash for structural integrity
+            h.update(f.relative_to(snap_root).as_posix().encode())
+            with open(f, "rb") as fh:
+                while chunk := fh.read(1 << 20):  # 1 MiB chunks
+                    h.update(chunk)
+            file_count += 1
+    return h.hexdigest(), file_count
 
 
 def _build_unaligned_segments(raw_segments: list[Any]) -> list[TranscriptSegment]:

@@ -34,13 +34,15 @@ TRANSCRIPT_FILE = "transcript.json"
 SRT_FILE = "transcript.srt"
 WORDS_FILE = "words.json"
 
+# Files always written for every transcription (raw is excluded by default — opt-in via --include-raw)
 ALL_ARTIFACT_FILES = (
     MANIFEST_FILE,
-    TRANSCRIPT_RAW_FILE,
     TRANSCRIPT_FILE,
     SRT_FILE,
     WORDS_FILE,
 )
+# Raw file is only written when explicitly requested (privacy-safe default)
+RAW_ARTIFACT_FILE = TRANSCRIPT_RAW_FILE
 
 
 class CacheIdentity:
