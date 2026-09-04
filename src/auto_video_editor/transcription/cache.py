@@ -25,7 +25,9 @@ from pathlib import Path
 from typing import Optional
 
 SCHEMA_VERSION = "1.0.0"
-ADAPTER_VERSION = "1.0.0"
+# Bumped to 1.1.0: old entries (using name-based model hash) produce different
+# job_ids and are rejected automatically. Old cache dirs are NOT deleted.
+ADAPTER_VERSION = "1.1.0"
 
 # Artifact filenames
 MANIFEST_FILE = "manifest.json"

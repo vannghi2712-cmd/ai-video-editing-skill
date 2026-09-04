@@ -151,13 +151,20 @@ def export_transcript_json(result: TranscriptResult) -> str:
     """
     Generate the canonical transcript.json (schema v1.0.0).
 
+    Root canonical structure (STEP_5 contract):
+      schema_version, status, source, engine, request, result, alignment,
+      metrics, warnings, provenance.
+
+    FORBIDDEN at root level: 'segments' (exists ONLY at result.segments).
+
     Strict JSON: serialized with allow_nan=False to reject NaN/Infinity.
-    Schema parity: segments are at root level (no result wrapper).
     """
-    import math as _math  # noqa: PLC0415 — re-import for clarity in this scope
+    segs = [_seg_to_dict(s) for s in result.segments]
+    full_text = " ".join(s.text for s in result.segments if s.text).strip()
 
     doc = {
         "schema_version": result.schema_version,
+        "status": "success",
         "source": {
             "path": result.source.path,
             "sha256": result.source.sha256,
@@ -172,7 +179,10 @@ def export_transcript_json(result: TranscriptResult) -> str:
             "compute_type": result.engine.compute_type,
         },
         "request": result.request,
-        "segments": [_seg_to_dict(s) for s in result.segments],
+        "result": {
+            "segments": segs,
+            "full_text": full_text,
+        },
         "alignment": {
             "requested_mode": result.alignment.requested_mode,
             "actual_status": result.alignment.actual_status,
@@ -182,6 +192,7 @@ def export_transcript_json(result: TranscriptResult) -> str:
             "words_aligned": result.alignment.words_aligned,
         },
         "metrics": result.metrics,
+        "warnings": [],
         "provenance": result.provenance,
     }
     # Strict serialization: NaN and Infinity are forbidden by JSON spec (RFC 8259)

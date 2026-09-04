@@ -192,3 +192,94 @@ ML .venv-whisperx:
 Phase 4 (Vision API, scene scoring, edit planning, FFmpeg rendering, CapCut, video-use,
 Cloudflare deployment) is **NOT implemented**.
 Explicit user authorization is required before Phase 4 begins.
+
+---
+
+## Phase 3 Final Contract Correction
+
+**Commit:** `4cab61b871075def8d261c1248d3dcbf2949e7dc`
+
+### Corrections Applied
+
+- DEFAULT_MODEL changed to "small" (production default; smoke tests use "tiny")
+- include_raw flag added (default: False) — privacy-safe raw output suppression
+- schemas/transcript.schema.json created (Draft 2020-12, v1.0.0) — but with root segments (fixed in Closure Correction 2)
+- Immutable model identities: hardcoded revision table (_KNOWN_HF_REVISIONS)
+- allow_nan=False, math.isfinite checks, "word" key for words in exporters.py
+- 31 regression tests added
+
+### Test Count After Final Correction
+
+`
+test_profile_cli.py:           25
+test_profile_loader.py:        45
+test_profile_validation.py:    24
+test_regression_phase2c.py:    85
+test_transcription.py:         85 (54 from Phase 3 + 31 new)
+Total:                        264 — all pass, exit 0
+`
+
+### Issues Fixed in Closure Correction 2
+
+1. root-level segments FORBIDDEN — must be result.segments
+2. Model alias passed to constructors (must use local snapshot path)
+3. jsonschema not a test dep; no Draft202012Validator tests
+4. ADAPTER_VERSION not bumped — old name-hash cache entries not rejected
+
+---
+
+## Phase 3 Closure Correction 2
+
+**Starting from:** 4cab61b871075def8d261c1248d3dcbf2949e7dc
+
+### Corrections Applied
+
+#### Pinned Local Snapshot Loading (STEP 4)
+
+- Added _ensure_snapshot(repo_id, pinned_sha, cache_root) using snapshot_download()
+- Verifies Path(snapshot_path).name == pinned_sha (integrity)
+- Identity derived from actual path, NOT from hardcoded table
+- transcribe(): passes snapshot_path to whisperx.load_model() with local_files_only=True
+- align(): passes snapshot_path as model_name to whisperx.load_align_model()
+- ADAPTER_VERSION bumped 1.0.0 -> 1.1.0 (rejects old cache without deleting dirs)
+
+#### Transcript Root Restored (STEP 5)
+
+- segments moved from root into result.segments
+- result.full_text added (concatenated segment text)
+- status: "success" and warnings: [] added at root
+
+#### Schema + Independent Validation (STEP 6)
+
+- schemas/transcript.schema.json updated: result required (not root segments)
+- pyproject.toml: test = ["jsonschema==4.26.0"] added (test-only dep)
+- 6 Draft202012Validator tests added (positive + 4 negative parity)
+
+### Smoke Test Results (STEP 7)
+
+`
+Exit: 0  |  Aligned words: 2/2  |  Char count: 7
+Text SHA-256: 96A58619087B85B27126E26AF14F89D44295A1DD7C93E82E69179B34485DA998
+transcript.raw.json: ABSENT
+ASR identity: hf:Systran/faster-whisper-tiny@d90ca5fe260221311c53c58e660288d3deb8d356
+Align identity: hf:nguyenvulebinh/wav2vec2-base-vi-vlsp2020@50a30dadb3ec98a0d4cdb1eb1ea315aff538f7c2
+Draft202012Validator: PASS  |  Cache hit (run 2): VERIFIED
+`
+
+### Test Count After Closure Correction 2
+
+`
+test_profile_cli.py:           25
+test_profile_loader.py:        45
+test_profile_validation.py:    24
+test_regression_phase2c.py:    85
+test_transcription.py:         97 (85 from 4cab61b − 6 removed + 18 new)
+Total:                        276 — all pass in both venvs, exit 0
+`
+
+Reconciliation: 264 − 6 (TestImmutableModelIdentity) + 7 (TestPinnedModelRevisions)
++ 3 (TestSchemaFile) + 6 (TestDraft202012Validation) + 2 (TestTranscriptJSONExport) = 276.
+
+### Phase 4 Status
+
+Phase 4 remains NOT implemented. Explicit authorization required.

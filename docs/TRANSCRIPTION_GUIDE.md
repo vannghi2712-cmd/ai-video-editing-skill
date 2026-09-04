@@ -100,7 +100,7 @@ Transcribe a local media file.
 | Option | Default | Notes |
 |---|---|---|
 | `--language` | `vi` | Vietnamese only — other languages rejected |
-| `--model` | `base` | Whisper model size: `tiny`, `base`, `small`, `medium`, `large-v3` |
+| `--model` | `small` | Whisper model size: `tiny`, `base`, `small`, `medium`, `large-v3` |
 | `--device` | `cpu` | CPU only — `--device cuda` is rejected |
 | `--compute-type` | `int8` | `int8` (fastest), `float32`, `float16` |
 | `--alignment` | `auto` | `auto` (best-effort), `on` (strict), `off` (skip) |
@@ -123,7 +123,7 @@ All outputs are written to `--output-dir`. Each run produces:
 | `transcript.json` | Schema v1.0.0 — source, engine, segments, alignment, metrics |
 | `transcript.srt` | SRT subtitles — sequential cues, UTF-8, non-overlapping |
 | `words.json` | Flat word list with `timing_status` (aligned/unaligned/failed) |
-| `transcript.raw.json` | Raw WhisperX ASR output (before normalization) |
+| `transcript.raw.json` | Raw WhisperX ASR output — opt-in only via `--include-raw` (default: absent) |
 | `manifest.json` | Job identity, cache key, artifact hashes |
 
 ---
@@ -168,7 +168,7 @@ All outputs are written to `--output-dir`. Each run produces:
     "coverage_fraction": 1.0
   },
   "metrics": { "total_elapsed_seconds": 8.5, "realtime_factor": 0.66 },
-  "provenance": { "adapter_version": "1.0.0", "whisperx_version": "3.8.6" }
+  "provenance": { "adapter_version": "1.1.0", "whisperx_version": "3.8.6" }
 }
 ```
 
@@ -207,11 +207,16 @@ by the current job configuration, the run is rejected. Pass `--force` to overwri
 
 Models are downloaded on first use to `model-cache/` (gitignored):
 
-| Model | Location | Size (approx) |
-|---|---|---|
-| Whisper tiny | `model-cache/asr/` | ~75 MB |
-| Whisper base | `model-cache/asr/` | ~145 MB |
-| Vietnamese wav2vec2 (`nguyenvulebinh/wav2vec2-base-vi-vlsp2020`) | `model-cache/align/` | ~375 MB |
+| Model | HF Repository | Cache location (hub layout) | Size (approx) |
+|---|---|---|---|
+| Whisper tiny | `Systran/faster-whisper-tiny` | `model-cache/models--Systran--faster-whisper-tiny/` | ~75 MB |
+| Whisper small | `Systran/faster-whisper-small` | `model-cache/models--Systran--faster-whisper-small/` | ~488 MB |
+| Vietnamese wav2vec2 | `nguyenvulebinh/wav2vec2-base-vi-vlsp2020` | `model-cache/models--nguyenvulebinh--wav2vec2-base-vi-vlsp2020/` | ~375 MB |
+
+Each model is pinned to an IMMUTABLE commit SHA (declared in `_PINNED_HF_REVISIONS`).
+`snapshot_download(revision=pinned_sha)` ensures only the pinned version is used.
+Local snapshot paths are passed directly to constructors — no alias loading.
+
 
 ---
 

@@ -21,6 +21,9 @@ transcription = [
 dev = [
     "pytest",
 ]
+test = [
+    "jsonschema==4.26.0",
+]
 
 [project.scripts]
 auto-video-editor = "auto_video_editor.cli:main"

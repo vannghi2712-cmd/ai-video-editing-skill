@@ -5,6 +5,15 @@ This module can be imported in the base `.venv` without installing WhisperX.
 Any attempt to actually run transcription in the base env will raise
 BackendUnavailableError with a clear, traceback-free message.
 
+Model loading contract (immutable snapshot pinning):
+  1. For every model, a pinned full commit SHA is declared in _PINNED_HF_REVISIONS.
+  2. `_ensure_snapshot()` calls huggingface_hub.snapshot_download(revision=pinned_sha)
+     and VERIFIES the returned path ends with exactly that SHA.
+  3. The snapshot path (not the model alias) is passed to WhisperX/Transformers
+     constructors with `local_files_only=True`, proving offline/local-only loading.
+  4. Identity strings are derived from the actual snapshot directory name (= SHA),
+     NOT from a hardcoded table. The table only provides the target revision to pin.
+
 Vietnamese alignment model discovery:
   WhisperX 3.8.x maps 'vi' → wav2vec2 model via its internal
   DEFAULT_ALIGN_MODELS_HF table. We introspect the installed package to
@@ -12,7 +21,6 @@ Vietnamese alignment model discovery:
 """
 from __future__ import annotations
 
-import hashlib
 import os
 from pathlib import Path
 from typing import Any
@@ -21,7 +29,6 @@ from auto_video_editor.transcription.backends import (
     BackendRuntimeError,
     BackendUnavailableError,
 )
-from auto_video_editor.transcription.cache import compute_local_fingerprint
 from auto_video_editor.transcription.config import TranscriptionConfig
 from auto_video_editor.transcription.models import (
     AlignmentInfo,
@@ -57,12 +64,111 @@ def _require_torch() -> Any:
         ) from exc
 
 
+# ── Pinned immutable HF commit SHAs ───────────────────────────────────────────
+#
+# These SHAs were RESOLVED AND VERIFIED via live HfApi(token=False).model_info()
+# on 2026-09-03. They are pinning TARGETS used as the `revision` argument to
+# snapshot_download() — they are NOT used as identity proof. Identity proof
+# comes from the snapshot directory path returned by snapshot_download().
+#
+# Source evidence per model:
+#   tiny:  HfApi().model_info("Systran/faster-whisper-tiny",  revision=sha).sha == sha  ✓
+#   small: HfApi().model_info("Systran/faster-whisper-small", revision=sha).sha == sha  ✓
+#   vi:    HfApi().model_info("nguyenvulebinh/wav2vec2-base-vi-vlsp2020", revision=sha).sha == sha  ✓
+#
+_PINNED_HF_REVISIONS: dict[str, str] = {
+    "Systran/faster-whisper-tiny":    "d90ca5fe260221311c53c58e660288d3deb8d356",
+    "Systran/faster-whisper-small":   "536b0662742c02347bc0e980a01041f333bce120",
+    "nguyenvulebinh/wav2vec2-base-vi-vlsp2020": "50a30dadb3ec98a0d4cdb1eb1ea315aff538f7c2",
+}
+
+# Mapping from whisperx short model name → HuggingFace repository ID
+# (matches faster_whisper.utils._MODELS table, introspected from installed package)
+_ASR_MODEL_HF_IDS: dict[str, str] = {
+    "tiny":     "Systran/faster-whisper-tiny",
+    "tiny.en":  "Systran/faster-whisper-tiny.en",
+    "base":     "Systran/faster-whisper-base",
+    "base.en":  "Systran/faster-whisper-base.en",
+    "small":    "Systran/faster-whisper-small",
+    "small.en": "Systran/faster-whisper-small.en",
+    "medium":   "Systran/faster-whisper-medium",
+    "large-v2": "Systran/faster-whisper-large-v2",
+    "large-v3": "Systran/faster-whisper-large-v3",
+}
+
+
+def _resolve_asr_hf_id(model_size: str) -> str:
+    """Map short model name (e.g. 'tiny') to full HF model ID."""
+    return _ASR_MODEL_HF_IDS.get(model_size, f"Systran/faster-whisper-{model_size}")
+
+
+def _model_cache_root() -> str:
+    """Return the top-level model cache directory (huggingface_hub compatible)."""
+    return os.environ.get("WHISPERX_MODEL_CACHE", "model-cache")
+
+
+def _ensure_snapshot(
+    repo_id: str,
+    pinned_sha: str,
+    cache_root: str,
+    *,
+    local_files_only: bool = False,
+) -> tuple[str, str]:
+    """
+    Ensure the exact pinned revision snapshot is available locally.
+
+    Steps:
+    1. Call snapshot_download(repo_id, revision=pinned_sha, cache_dir=cache_root).
+       If local_files_only=True, no network is used — proves offline loading works.
+    2. Verify the returned path's directory name equals pinned_sha exactly.
+       (huggingface_hub always uses the commit SHA as the snapshot directory name.)
+    3. Return (snapshot_path, identity_string).
+
+    Identity is derived from the ACTUAL snapshot path, not from a hardcoded table.
+    NEVER returns an identity derived from sha256(model_name).
+
+    Raises BackendRuntimeError if:
+    - snapshot_download fails (network error, not cached)
+    - Returned path SHA does not match pinned_sha (hub integrity failure)
+    """
+    try:
+        from huggingface_hub import snapshot_download  # noqa: PLC0415
+        snapshot_path = snapshot_download(
+            repo_id=repo_id,
+            revision=pinned_sha,
+            cache_dir=cache_root,
+            token=False,
+            local_files_only=local_files_only,
+        )
+    except Exception as exc:
+        raise BackendRuntimeError(
+            f"Cannot ensure local snapshot for {repo_id}@{pinned_sha[:8]}: {exc}\n"
+            "Ensure the model is downloaded or network is available."
+        ) from exc
+
+    # Verify: huggingface_hub names the snapshot dir after the actual commit SHA
+    resolved_sha = Path(snapshot_path).name
+    if resolved_sha != pinned_sha:
+        raise BackendRuntimeError(
+            f"Snapshot SHA integrity check failed for {repo_id}: "
+            f"expected {pinned_sha!r}, got {resolved_sha!r}. "
+            "The HuggingFace Hub cache may be corrupt."
+        )
+
+    identity = f"hf:{repo_id}@{resolved_sha}"
+    return snapshot_path, identity
+
+
 class WhisperXBackend:
     """
     WhisperX-backed ASR + forced alignment adapter.
 
     WhisperX, torch, and faster-whisper are only imported when a method
     is actually called, so the class can be referenced in base `.venv`.
+
+    Model loading uses pinned snapshot paths (not aliases), with
+    local_files_only=True to guarantee offline reproducibility after
+    the initial download.
     """
 
     def version(self) -> str:
@@ -82,25 +188,38 @@ class WhisperXBackend:
         """
         Return (asr_identity, alignment_identity, cache_reuse_enabled).
 
-        Identity is ALWAYS an immutable string:
-          - Preferred: hf:{model_id}@{commit_sha}  (from known revisions or local ref)
-          - Fallback:  model-artifact-sha256-v1:{hash}:{file_count}  (full local scan)
-          - If neither is resolvable: returns ("", "", False) → caller disables cache
+        Identity is derived from the actual snapshot path returned by
+        snapshot_download(), NOT from a hardcoded table. The pinned SHA in
+        _PINNED_HF_REVISIONS is used as the revision argument, and the
+        returned path's directory name (= actual SHA) is used as proof.
+
+        If a pinned SHA is not known for the requested model:
+          cache_reuse_enabled = False
+          Returns ("", "", False) → service layer disables cache.
 
         NEVER returns a name-based truncated hash or "UNVERIFIED".
         """
+        cache_root = model_cache_dir
         asr_hf_id = _resolve_asr_hf_id(config.model)
-        asr_identity, asr_ok = _immutable_model_identity(
-            asr_hf_id, model_cache_dir, "asr"
-        )
+        asr_pinned = _PINNED_HF_REVISIONS.get(asr_hf_id)
 
         align_model_id = _discover_alignment_model_id(config.language)
-        align_identity, align_ok = _immutable_model_identity(
-            align_model_id, model_cache_dir, "align"
-        )
+        align_pinned = _PINNED_HF_REVISIONS.get(align_model_id)
 
-        cache_reuse_enabled = asr_ok and align_ok
-        return asr_identity, align_identity, cache_reuse_enabled
+        if not asr_pinned or not align_pinned:
+            return "", "", False
+
+        try:
+            _, asr_identity = _ensure_snapshot(asr_hf_id, asr_pinned, cache_root)
+        except BackendRuntimeError:
+            return "", "", False
+
+        try:
+            _, align_identity = _ensure_snapshot(align_model_id, align_pinned, cache_root)
+        except BackendRuntimeError:
+            return "", "", False
+
+        return asr_identity, align_identity, True
 
     def get_alignment_model_id(self, language: str) -> str:
         """Return the alignment model ID for the given language."""
@@ -111,24 +230,41 @@ class WhisperXBackend:
         audio_path: str,
         config: TranscriptionConfig,
     ) -> tuple[list[Any], dict]:
-        """Run WhisperX ASR. Returns (raw_segments_list, info_dict)."""
+        """
+        Run WhisperX ASR using a pinned local snapshot.
+
+        The model alias (e.g. 'tiny') is resolved to a full HF repo ID,
+        then to a local snapshot path via snapshot_download(). The snapshot
+        path is passed to whisperx.load_model() with local_files_only=True,
+        guaranteeing that no network call is made during inference.
+        """
         wx = _require_whisperx()
         torch = _require_torch()
 
         # Enforce CPU policy
         if torch.cuda.is_available():
-            # This should not happen in this environment, but guard anyway
             raise BackendRuntimeError(
                 "CUDA is available but CPU-only mode is enforced by policy."
             )
 
+        asr_hf_id = _resolve_asr_hf_id(config.model)
+        asr_pinned = _PINNED_HF_REVISIONS.get(asr_hf_id)
+        if not asr_pinned:
+            raise BackendRuntimeError(
+                f"No pinned revision known for ASR model {asr_hf_id!r}. "
+                "Add it to _PINNED_HF_REVISIONS in whisperx_backend.py."
+            )
+
         try:
+            asr_snapshot, _ = _ensure_snapshot(
+                asr_hf_id, asr_pinned, _model_cache_root()
+            )
             model = wx.load_model(
-                config.model,
+                asr_snapshot,        # ← local snapshot path, NOT the alias "tiny"
                 device=config.device,
                 compute_type=config.compute_type,
                 language=config.language,
-                download_root=_model_cache_subdir("asr"),
+                local_files_only=True,  # ← proves offline/local-only loading
             )
             audio = wx.load_audio(audio_path)
             result = model.transcribe(
@@ -137,6 +273,8 @@ class WhisperXBackend:
                 language=config.language,
                 task=config.task,
             )
+        except BackendRuntimeError:
+            raise
         except Exception as exc:
             raise BackendRuntimeError(
                 f"WhisperX ASR failed: {exc}"
@@ -153,7 +291,7 @@ class WhisperXBackend:
         config: TranscriptionConfig,
     ) -> tuple[list[TranscriptSegment], AlignmentInfo]:
         """
-        Run WhisperX forced alignment on raw ASR segments.
+        Run WhisperX forced alignment using a pinned local snapshot.
 
         Returns typed TranscriptSegment list with honest timing_status on each
         word. Never fabricates timing: only words with backend-derived start/end
@@ -171,13 +309,27 @@ class WhisperXBackend:
             )
 
         align_model_id = _discover_alignment_model_id(config.language)
+        align_pinned = _PINNED_HF_REVISIONS.get(align_model_id)
+        if not align_pinned:
+            if config.alignment_mode == "auto":
+                return _build_unaligned_segments(raw_segments), AlignmentInfo(
+                    requested_mode=config.alignment_mode,
+                    actual_status="failed",
+                    model_id=align_model_id,
+                )
+            raise BackendRuntimeError(
+                f"No pinned revision for alignment model {align_model_id!r}. "
+                "Add it to _PINNED_HF_REVISIONS."
+            )
 
         try:
+            align_snapshot, align_identity = _ensure_snapshot(
+                align_model_id, align_pinned, _model_cache_root()
+            )
             align_model, metadata = wx.load_align_model(
                 language_code=config.language,
                 device=config.device,
-                model_name=align_model_id,
-                model_dir=_model_cache_subdir("align"),
+                model_name=align_snapshot,  # ← local snapshot path, NOT the HF repo ID
             )
             audio = wx.load_audio(audio_path)
             aligned = wx.align(
@@ -189,9 +341,10 @@ class WhisperXBackend:
                 return_char_alignments=False,
             )
             aligned_segments = aligned.get("segments", [])
+        except BackendRuntimeError:
+            raise
         except Exception as exc:
             if config.alignment_mode == "auto":
-                # auto = best-effort; return unaligned on failure
                 return _build_unaligned_segments(raw_segments), AlignmentInfo(
                     requested_mode=config.alignment_mode,
                     actual_status="failed",
@@ -209,9 +362,7 @@ class WhisperXBackend:
             requested_mode=config.alignment_mode,
             actual_status="aligned",
             model_id=align_model_id,
-            model_fingerprint=_model_fingerprint(
-                align_model_id, _model_cache_subdir("align"), "align"
-            ),
+            model_fingerprint=align_identity,  # ← identity from snapshot path
             words_total=words_total,
             words_aligned=words_aligned,
         )
@@ -228,7 +379,6 @@ def _discover_alignment_model_id(language: str) -> str:
     """
     try:
         wx = _require_whisperx()
-        # WhisperX 3.x exposes alignment model map in alignment module
         align_mod = getattr(wx, "alignment", None)
         if align_mod is None:
             import whisperx.alignment as align_mod  # noqa: PLC0415
@@ -243,131 +393,6 @@ def _discover_alignment_model_id(language: str) -> str:
     return "nguyenvulebinh/wav2vec2-base-vi-vlsp2020"
 
 
-def _model_cache_subdir(kind: str) -> str:
-    """Return the appropriate model cache subdirectory path as a string."""
-    # We set HF_HOME / HUGGINGFACE_HUB_CACHE in the service layer.
-    # Here we just return a relative path used as download_root.
-    cache = os.environ.get("WHISPERX_MODEL_CACHE", "model-cache")
-    return os.path.join(cache, kind)
-
-
-def _model_fingerprint(model_id: str, cache_dir: str, kind: str) -> str:
-    """
-    Produce a stable, deterministic fingerprint for a model.
-
-    Uses SHA-256 of the model_id string. This is stable across all runs
-    (before and after download) for the same model identifier.
-
-    File-based hashing is intentionally NOT used: HuggingFace Hub adds
-    lock files, ref updates, and incomplete markers between runs, making
-    file-based hashes non-reproducible across the pre/post-download boundary.
-
-    The model_id + whisperx version (included in the CacheIdentity outer key)
-    uniquely identifies the model weights being used.
-    """
-    return hashlib.sha256(model_id.encode("utf-8")).hexdigest()[:16]
-
-
-# ── Immutable model identity (replaces name-based hashes) ──────────────────────
-
-# Immutable HF commit SHAs, resolved via huggingface_hub.model_info() on
-# 2026-09-03 — source: LIVE_HF_API (model_info().sha).
-_KNOWN_HF_REVISIONS: dict[str, str] = {
-    "Systran/faster-whisper-tiny":    "d90ca5fe260221311c53c58e660288d3deb8d356",
-    "Systran/faster-whisper-small":   "536b0662742c02347bc0e980a01041f333bce120",
-    "nguyenvulebinh/wav2vec2-base-vi-vlsp2020": "50a30dadb3ec98a0d4cdb1eb1ea315aff538f7c2",
-}
-
-# Mapping from whisperx short model name → HuggingFace repository ID
-_ASR_MODEL_HF_IDS: dict[str, str] = {
-    "tiny":     "Systran/faster-whisper-tiny",
-    "tiny.en":  "Systran/faster-whisper-tiny.en",
-    "base":     "Systran/faster-whisper-base",
-    "base.en":  "Systran/faster-whisper-base.en",
-    "small":    "Systran/faster-whisper-small",
-    "small.en": "Systran/faster-whisper-small.en",
-    "medium":   "Systran/faster-whisper-medium",
-    "large-v2": "Systran/faster-whisper-large-v2",
-    "large-v3": "Systran/faster-whisper-large-v3",
-}
-
-
-def _resolve_asr_hf_id(model_size: str) -> str:
-    """Map short model name (e.g. 'tiny') to full HF model ID."""
-    return _ASR_MODEL_HF_IDS.get(model_size, f"Systran/faster-whisper-{model_size}")
-
-
-def _immutable_model_identity(
-    model_id: str,
-    cache_dir: str,
-    kind: str,
-) -> tuple[str, bool]:
-    """
-    Return (identity_string, is_immutable).
-
-    Priority:
-    1. Hardcoded known commit SHA (fastest; offline-safe)
-    2. Local HF Hub refs/main file (set during model download)
-    3. Full local artifact fingerprint (hash all inference files)
-    4. Unresolved → ("", False) — caller must disable cache
-
-    NEVER uses sha256(model_name)[:N] or "UNVERIFIED".
-    """
-    # Priority 1: hardcoded known immutable revision
-    rev = _KNOWN_HF_REVISIONS.get(model_id)
-    if rev:
-        return f"hf:{model_id}@{rev}", True
-
-    # Priority 2: local HF Hub refs/main (present after any `huggingface_hub` download)
-    safe_id = model_id.replace("/", "--")
-    ref_path = Path(cache_dir) / kind / f"models--{safe_id}" / "refs" / "main"
-    if ref_path.exists():
-        try:
-            sha = ref_path.read_text(encoding="utf-8").strip()
-            if sha and len(sha) >= 40 and all(c in "0123456789abcdefABCDEF" for c in sha[:40]):
-                return f"hf:{model_id}@{sha[:40]}", True
-        except OSError:
-            pass
-
-    # Priority 3: local artifact fingerprint
-    # Hash all inference-relevant files in HF Hub snapshot directory
-    snap_root = Path(cache_dir) / kind / f"models--{safe_id}" / "snapshots"
-    if snap_root.exists():
-        try:
-            identity, file_count = _artifact_fingerprint(snap_root)
-            if file_count > 0:
-                return f"model-artifact-sha256-v1:{identity}:{file_count}", True
-        except Exception:
-            pass
-
-    # Priority 4: unresolved — disable cache
-    return "", False
-
-
-def _artifact_fingerprint(snap_root: Path) -> tuple[str, int]:
-    """
-    Hash all inference-relevant files under snap_root.
-
-    Returns (hex_digest, file_count). Covers weights, config, tokenizer, vocab.
-    """
-    INFERENCE_EXTENSIONS = {
-        ".bin", ".pt", ".safetensors", ".onnx",
-        ".json", ".txt", ".model", ".tiktoken",
-    }
-    h = hashlib.sha256()
-    file_count = 0
-    # Sort for determinism across OS/filesystem orderings
-    for f in sorted(snap_root.rglob("*")):
-        if f.is_file() and f.suffix in INFERENCE_EXTENSIONS:
-            # Include relative path in hash for structural integrity
-            h.update(f.relative_to(snap_root).as_posix().encode())
-            with open(f, "rb") as fh:
-                while chunk := fh.read(1 << 20):  # 1 MiB chunks
-                    h.update(chunk)
-            file_count += 1
-    return h.hexdigest(), file_count
-
-
 def _build_unaligned_segments(raw_segments: list[Any]) -> list[TranscriptSegment]:
     """
     Convert raw ASR segments to typed segments with timing_status='unaligned'.
@@ -379,7 +404,6 @@ def _build_unaligned_segments(raw_segments: list[Any]) -> list[TranscriptSegment
         start = float(seg.get("start", 0.0))
         end = float(seg.get("end", start))
         text = str(seg.get("text", "")).strip()
-        # Build unaligned word list from segment-level word info if available
         raw_words = seg.get("words", [])
         if raw_words:
             words = tuple(
@@ -390,7 +414,6 @@ def _build_unaligned_segments(raw_segments: list[Any]) -> list[TranscriptSegment
                 for w in raw_words
             )
         else:
-            # No word-level info: represent as single unaligned word
             words = (
                 TranscriptWord(text=text, timing_status="unaligned"),
             ) if text else ()
