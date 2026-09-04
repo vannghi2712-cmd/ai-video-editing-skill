@@ -221,6 +221,10 @@ def build_parser() -> argparse.ArgumentParser:
     from auto_video_editor.transcription.cli_commands import register_transcribe_commands  # noqa: PLC0415
     register_transcribe_commands(subparsers)
 
+    # --- analyze (Phase 4) — vision deps are lazy-loaded ---
+    from auto_video_editor.analysis.cli_commands import register_analyze_commands  # noqa: PLC0415
+    register_analyze_commands(subparsers)
+
     return parser
 
 
@@ -244,6 +248,12 @@ def main(argv: list[str] | None = None) -> int:
 
         if args.command == "transcribe":
             # Dispatch to transcribe sub-subcommand (func set by register_transcribe_commands)
+            func = getattr(args, "func", None)
+            if func is not None:
+                return func(args)
+
+        if args.command == "analyze":
+            # Dispatch to analyze sub-subcommand (func set by register_analyze_commands)
             func = getattr(args, "func", None)
             if func is not None:
                 return func(args)

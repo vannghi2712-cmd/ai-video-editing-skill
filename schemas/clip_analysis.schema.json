@@ -1,0 +1,152 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://auto-video-editor/schemas/clip_analysis/1.0.0",
+  "title": "ClipAnalysis",
+  "description": "Phase 4 scene analysis output. Draft 2020-12. Version 1.0.0.",
+  "type": "object",
+  "required": [
+    "schema_version", "status", "source", "profile",
+    "detector_config", "scenes", "scores", "keyframe_summary",
+    "summary", "warnings", "metrics", "provenance"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "const": "1.0.0"
+    },
+    "status": {
+      "type": "string",
+      "enum": ["complete", "partial", "failed"]
+    },
+    "source": {
+      "type": "object",
+      "required": ["filename", "sha256", "duration_seconds", "size_bytes", "width", "height", "fps", "has_audio", "codec"],
+      "additionalProperties": false,
+      "properties": {
+        "filename": {"type": "string"},
+        "sha256": {"type": "string", "minLength": 64, "maxLength": 64},
+        "duration_seconds": {"type": "number", "exclusiveMinimum": 0},
+        "size_bytes": {"type": "integer", "minimum": 0},
+        "width": {"type": "integer", "minimum": 1},
+        "height": {"type": "integer", "minimum": 1},
+        "fps": {"type": "number", "minimum": 0},
+        "has_audio": {"type": "boolean"},
+        "codec": {"type": "string"}
+      }
+    },
+    "profile": {
+      "type": "object",
+      "required": ["profile_id", "profile_hash"],
+      "additionalProperties": false,
+      "properties": {
+        "profile_id": {"type": "string"},
+        "profile_hash": {"type": "string"}
+      }
+    },
+    "detector_config": {
+      "type": "object",
+      "required": ["threshold", "min_duration_seconds", "max_duration_seconds"],
+      "additionalProperties": false,
+      "properties": {
+        "threshold": {"type": "number", "exclusiveMinimum": 0, "exclusiveMaximum": 1},
+        "min_duration_seconds": {"type": "number", "exclusiveMinimum": 0},
+        "max_duration_seconds": {"type": "number", "exclusiveMinimum": 0}
+      }
+    },
+    "scenes": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["index", "start_seconds", "end_seconds", "duration_seconds", "raw_score"],
+        "additionalProperties": false,
+        "properties": {
+          "index": {"type": "integer", "minimum": 0},
+          "start_seconds": {"type": "number", "minimum": 0},
+          "end_seconds": {"type": "number", "minimum": 0},
+          "duration_seconds": {"type": "number", "exclusiveMinimum": 0},
+          "raw_score": {"type": ["number", "null"]}
+        }
+      }
+    },
+    "scores": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["scene_index", "provider", "model_id", "prompt_version", "status", "weighted_score", "keyframes_used", "dimensions"],
+        "additionalProperties": false,
+        "properties": {
+          "scene_index": {"type": "integer", "minimum": 0},
+          "provider": {"type": "string"},
+          "model_id": {"type": ["string", "null"]},
+          "prompt_version": {"type": "string"},
+          "status": {"type": "string", "enum": ["scored", "insufficient_evidence", "failed"]},
+          "weighted_score": {"type": ["number", "null"]},
+          "keyframes_used": {"type": "integer", "minimum": 0},
+          "dimensions": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": ["dimension", "weight", "score", "confidence", "status"],
+              "additionalProperties": false,
+              "properties": {
+                "dimension": {"type": "string"},
+                "weight": {"type": "integer", "minimum": 0},
+                "score": {"type": ["number", "null"]},
+                "confidence": {"type": ["number", "null"]},
+                "status": {"type": "string", "enum": ["scored", "insufficient_evidence"]}
+              }
+            }
+          }
+        }
+      }
+    },
+    "keyframe_summary": {
+      "type": "object",
+      "required": ["total", "successful", "failed", "sha256s"],
+      "additionalProperties": false,
+      "properties": {
+        "total": {"type": "integer", "minimum": 0},
+        "successful": {"type": "integer", "minimum": 0},
+        "failed": {"type": "integer", "minimum": 0},
+        "sha256s": {"type": "array", "items": {"type": "string"}}
+      }
+    },
+    "summary": {
+      "type": "object",
+      "required": ["scene_count", "scenes_scored", "average_weighted_score"],
+      "additionalProperties": false,
+      "properties": {
+        "scene_count": {"type": "integer", "minimum": 0},
+        "scenes_scored": {"type": "integer", "minimum": 0},
+        "average_weighted_score": {"type": ["number", "null"]}
+      }
+    },
+    "warnings": {
+      "type": "array",
+      "items": {"type": "string"}
+    },
+    "metrics": {
+      "type": "object",
+      "required": ["elapsed_seconds", "scenes_detected", "keyframes_extracted", "scenes_scored"],
+      "additionalProperties": true,
+      "properties": {
+        "elapsed_seconds": {"type": "number", "minimum": 0},
+        "scenes_detected": {"type": "integer", "minimum": 0},
+        "keyframes_extracted": {"type": "integer", "minimum": 0},
+        "scenes_scored": {"type": "integer", "minimum": 0}
+      }
+    },
+    "provenance": {
+      "type": "object",
+      "required": ["analysis_schema_version", "provider", "model_id", "prompt_version"],
+      "additionalProperties": true,
+      "properties": {
+        "analysis_schema_version": {"type": "string"},
+        "provider": {"type": "string"},
+        "model_id": {"type": ["string", "null"]},
+        "prompt_version": {"type": "string"}
+      }
+    }
+  }
+}

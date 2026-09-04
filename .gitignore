@@ -1,4 +1,4 @@
-# OS
+ï»¿# OS
 .DS_Store
 Thumbs.db
 
@@ -18,7 +18,7 @@ build/
 # Project working files (generated during editing)
 footage/
 output/
-analysis/
+/analysis/
 reference/
 segments/
 highlights/
@@ -41,7 +41,7 @@ qc_frames/
 skills/
 skills-lock.json
 
-# Phase 3 — ML environment and caches (never commit)
+# Phase 3 ï¿½ ML environment and caches (never commit)
 .venv-whisperx/
 model-cache/
 .transcription-cache/
@@ -50,3 +50,9 @@ transcription-output/
 # Python compiled artifacts (nested)
 **/__pycache__/
 **/*.pyc
+
+# Phase 4 - Scene analysis caches and runtime artifacts (never commit)
+.scene-analysis-cache/
+scene-analysis-output/
+keyframes/
+analysis-output/

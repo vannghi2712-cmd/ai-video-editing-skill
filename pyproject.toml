@@ -24,6 +24,11 @@ dev = [
 test = [
     "jsonschema==4.26.0",
 ]
+# Optional OpenAI Vision adapter — lazy-imported, NEVER part of mandatory runtime.
+# Install only when using --provider openai.
+vision-openai = [
+    "openai==3.8.0",
+]
 
 [project.scripts]
 auto-video-editor = "auto_video_editor.cli:main"
