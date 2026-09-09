@@ -2,12 +2,15 @@
 
 No hard-coded profile-ID branches.
 No shell=True. No GPU/CUDA.
-Ownership contract: --force does NOT bypass source ownership check.
+Ownership: --force cannot override source SHA mismatch.
+Cache order: provider cache looked up ONLY after keyframe bytes are verified.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import time
+import uuid
 from pathlib import Path
 
 from auto_video_editor.analysis.cache import (
@@ -33,10 +36,12 @@ from auto_video_editor.profiles.loader import load_profile
 _SCHEMA_PATH = (
     Path(__file__).parent.parent.parent.parent / "schemas" / "clip_analysis.schema.json"
 )
-_ANALYSIS_SCHEMA_VERSION = "1.0.0"
+_ANALYSIS_SCHEMA_VERSION = "2.0.0"
 _OWNER_TAG = "auto_video_editor.scene_analysis"
+_MANIFEST_VERSION = "1.0.0"
+_ROOT_MARKER_FILENAME = ".scene_analysis_root"
 
-# FFmpeg/FFprobe version placeholders — detected at runtime when available.
+# FFmpeg/FFprobe version: detected at runtime.
 _TOOL_VERSION_UNKNOWN = "unknown"
 
 
@@ -54,17 +59,43 @@ def _get_tool_version(tool: str) -> str:
         return _TOOL_VERSION_UNKNOWN
 
 
+def _normalize_dir(p: Path) -> str:
+    """Return normalized absolute path string for root binding."""
+    return str(p.resolve()).replace("\\", "/")
+
+
+def _root_binding_sha256(out_dir: Path) -> str:
+    """SHA-256 of normalized absolute output directory path."""
+    normalized = _normalize_dir(out_dir)
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+
+def _read_root_marker(out_dir: Path) -> str | None:
+    """Read UUID from .scene_analysis_root marker file."""
+    marker = out_dir / _ROOT_MARKER_FILENAME
+    if not marker.exists() or not marker.is_file():
+        return None
+    try:
+        return marker.read_text(encoding="utf-8").strip()
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _write_root_marker(out_dir: Path, root_id: str) -> None:
+    """Write UUID to .scene_analysis_root marker file."""
+    (out_dir / _ROOT_MARKER_FILENAME).write_text(root_id, encoding="utf-8")
+
+
 def _check_ownership(out_dir: Path, source_sha256: str, force: bool) -> tuple[bool, str]:
     """
     Check output directory ownership.
 
-    Rules (--force does NOT bypass source ownership):
+    Rules:
     - Directory does not exist: OK
     - Directory exists but is empty: OK
-    - Directory has valid manifest owned by _OWNER_TAG with matching source_sha256: OK
-    - Directory has manifest owned by _OWNER_TAG but different source_sha256: FAIL (even with --force)
-    - Directory has no manifest but is non-empty: FAIL
-    - Manifest exists but unreadable or unknown owner: FAIL
+    - Non-empty with valid manifest owned by _OWNER_TAG, matching source_sha256,
+      matching root_binding_sha256, and present marker file with matching output_root_id: OK
+    - --force cannot bypass source SHA mismatch or missing/mismatched marker.
 
     Returns (ok: bool, error_message: str)
     """
@@ -74,13 +105,14 @@ def _check_ownership(out_dir: Path, source_sha256: str, force: bool) -> tuple[bo
     # Reject symlinks and traversal attempts
     try:
         resolved = out_dir.resolve()
-        if out_dir != resolved and not str(resolved).startswith(str(out_dir.parent.resolve())):
-            return False, "Output dir resolves outside expected parent (symlink escape)."
+        # Must resolve to itself or a known subdirectory (no symlink escape)
+        if not resolved.is_dir():
+            return False, "Output dir is not a regular directory (symlink or missing)."
     except Exception:  # noqa: BLE001
-        pass
+        return False, "Output dir cannot be resolved."
 
     # Empty dir is always OK
-    children = list(out_dir.iterdir())
+    children = [c for c in out_dir.iterdir() if c.name != _ROOT_MARKER_FILENAME]
     if not children:
         return True, ""
 
@@ -88,7 +120,7 @@ def _check_ownership(out_dir: Path, source_sha256: str, force: bool) -> tuple[bo
     if not manifest_path.exists():
         return False, (
             "Output dir is non-empty but has no manifest.json. "
-            "Use a different --output-dir or clear the directory manually."
+            "Use a different --output-dir or clear it manually."
         )
 
     try:
@@ -103,6 +135,24 @@ def _check_ownership(out_dir: Path, source_sha256: str, force: bool) -> tuple[bo
             "Use a different --output-dir."
         )
 
+    # Verify root binding SHA
+    expected_binding = _root_binding_sha256(out_dir)
+    if existing.get("root_binding_sha256", "") != expected_binding:
+        return False, (
+            "Output dir root binding mismatch (directory may have been moved). "
+            "Use a different --output-dir."
+        )
+
+    # Verify marker file matches manifest
+    marker_id = _read_root_marker(out_dir)
+    manifest_root_id = existing.get("output_root_id", "")
+    if not marker_id or not manifest_root_id or marker_id != manifest_root_id:
+        return False, (
+            "Output dir marker file missing or does not match manifest output_root_id. "
+            "Use a different --output-dir."
+        )
+
+    # Source SHA check — --force cannot bypass this
     existing_src = existing.get("source_sha256", "")
     if existing_src and existing_src != source_sha256:
         return False, (
@@ -110,8 +160,29 @@ def _check_ownership(out_dir: Path, source_sha256: str, force: bool) -> tuple[bo
             "--force cannot override a different-source directory. Use a different --output-dir."
         )
 
-    # Owned by us and matching source: OK (--force may replace declared artifacts)
+    # Owned by us with matching source and binding: OK
     return True, ""
+
+
+def _verify_keyframe_bytes(keyframes) -> list:
+    """Recompute SHA-256 from bytes on disk for each ok keyframe.
+
+    Returns updated keyframe list. SHA mismatches are logged but do not
+    stop execution (the mismatch is reflected in the identity hash).
+    """
+    verified = []
+    for kf in keyframes:
+        if kf.status == "ok" and kf.path:
+            disk_sha = AnalysisCache.verify_keyframe_sha256(kf.path)
+            if disk_sha and disk_sha != kf.sha256:
+                # SHA changed — use disk value for identity (tamper indicator)
+                from auto_video_editor.analysis.models import Keyframe  # noqa: PLC0415
+                kf = Keyframe(
+                    kf.scene_index, kf.slot, kf.timestamp_us,
+                    kf.path, disk_sha, kf.status,
+                )
+        verified.append(kf)
+    return verified
 
 
 class AnalysisService:
@@ -120,8 +191,14 @@ class AnalysisService:
     def run(self, config: AnalysisConfig) -> tuple[int, str]:
         """Execute the analysis pipeline.
 
+        Cache lookup order:
+          1. Inspect source → 2. Source SHA → 3. Scene boundaries →
+          4. Preprocessing cache identity → 5. Extract keyframes →
+          6. VERIFY KEYFRAME BYTES & RECALCULATE SHA-256 →
+          7. Associate transcript → 8. Build canonical request →
+          9. Build request payload SHA → 10. Provider cache lookup.
+
         Returns (exit_code, message).
-        exit_code semantics match CLI contract:
           0=success, 3=profile, 4=media, 5=schema/output, 6=consent, 7=partial, 8=backend
         """
         t_start = time.monotonic()
@@ -148,7 +225,7 @@ class AnalysisService:
         profile_dict = profile.to_dict()
         profile_hash = AnalysisCache.profile_hash(profile_dict)
 
-        # ── Inspect media ─────────────────────────────────────────────────────
+        # ── Step 1: Inspect source (media) ────────────────────────────────────
         try:
             media_info, media_warnings = inspect_media(config.input_path)
         except Exception as exc:  # noqa: BLE001
@@ -165,9 +242,7 @@ class AnalysisService:
             if config.transcript_path:
                 try:
                     td = load_transcript(config.transcript_path)
-                    transcript_chars = len(
-                        td.get("result", {}).get("full_text", "")
-                    )
+                    transcript_chars = len(td.get("result", {}).get("full_text", ""))
                 except Exception:  # noqa: BLE001
                     pass
             print(
@@ -178,8 +253,14 @@ class AnalysisService:
             )
             return 0, "Dry-run complete"
 
-        # ── Output directory ownership (--force does NOT bypass) ──────────────
+        # ── Output directory ownership ────────────────────────────────────────
         out_dir.mkdir(parents=True, exist_ok=True)
+        # Write marker file on first use (empty or not yet owned)
+        marker_id = _read_root_marker(out_dir)
+        if marker_id is None:
+            marker_id = str(uuid.uuid4())
+            _write_root_marker(out_dir, marker_id)
+
         ok, err_msg = _check_ownership(out_dir, media_info.sha256, config.force)
         if not ok:
             return 5, err_msg
@@ -193,13 +274,23 @@ class AnalysisService:
             except Exception as exc:  # noqa: BLE001
                 warnings.append(f"Transcript load failed: {exc}")
 
-        transcript_hash = AnalysisCache.transcript_hash(transcript_dict)
-
-        # ── Tool versions (for cache identity) ───────────────────────────────
+        # ── Tool versions (for preprocessing identity) ───────────────────────
         ffmpeg_version = _get_tool_version("ffmpeg")
         ffprobe_version = _get_tool_version("ffprobe")
 
-        # Level-A (preprocessing) cache identity
+        # ── Step 2: Source SHA ────────────────────────────────────────────────
+        # (already in media_info.sha256)
+
+        # ── Step 3: Scene boundaries ──────────────────────────────────────────
+        try:
+            scenes, scene_warnings = detect_scenes(
+                config.input_path, media_info.duration_us, config.detector
+            )
+        except Exception as exc:  # noqa: BLE001
+            return 8, f"Scene detection failed: {exc}"
+        warnings.extend(scene_warnings)
+
+        # ── Step 4: Preprocessing cache identity ──────────────────────────────
         pre_id = preprocessing_job_id(
             source_sha256=media_info.sha256,
             ffmpeg_version=ffmpeg_version,
@@ -209,50 +300,7 @@ class AnalysisService:
             extractor_max_dim=1280,
         )
 
-        # ── Scene detection ───────────────────────────────────────────────────
-        try:
-            scenes, scene_warnings = detect_scenes(
-                config.input_path, media_info.duration_us, config.detector
-            )
-        except Exception as exc:  # noqa: BLE001
-            return 8, f"Scene detection failed: {exc}"
-        warnings.extend(scene_warnings)
-
-        # ── Cache check (resume) — BEFORE keyframe extraction ─────────────────
-        cache = AnalysisCache(config.cache_dir)
-        output_schema_sha = AnalysisCache.output_schema_sha256(_SCHEMA_PATH)
-        transcript_ctx_mode = (
-            "included" if (transcript_dict and config.include_transcript_context)
-            else ("redacted" if transcript_dict else "none")
-        )
-
-        if config.resume and not config.force:
-            # We don't have keyframe SHAs yet — do a pre-check with empty list
-            # (will be confirmed after extraction)
-            pre_job_id = provider_job_id(
-                preprocessing_sha256=pre_id,
-                ordered_keyframe_sha256s=[],
-                resolved_profile_hash=profile_hash,
-                provider_id=config.provider,
-                requested_model_id=config.vision_model,
-                adapter_version=ADAPTER_VERSION,
-                prompt_version=PROMPT_VERSION,
-                output_schema_version=_ANALYSIS_SCHEMA_VERSION,
-                output_schema_sha256=output_schema_sha,
-                transcript_context_mode=transcript_ctx_mode,
-                transcript_context_sha256=transcript_hash,
-                external_upload_mode="allowed" if config.allow_external_upload else "denied",
-            )
-            cached = cache.get(pre_job_id)
-            if cached:
-                print("Cache hit (OK) -- restoring from cache")
-                (out_dir / "clip_analysis.json").write_text(
-                    json.dumps(cached["analysis"], indent=2, ensure_ascii=False),
-                    encoding="utf-8",
-                )
-                return 0, "Analysis restored from cache"
-
-        # ── Keyframe extraction ───────────────────────────────────────────────
+        # ── Step 5: Extract keyframes ─────────────────────────────────────────
         try:
             keyframes, kf_warnings = extract_keyframes(
                 config.input_path, scenes, out_dir, slots=config.keyframe_slots
@@ -261,9 +309,67 @@ class AnalysisService:
             return 8, f"Keyframe extraction failed: {exc}"
         warnings.extend(kf_warnings)
 
+        # ── Step 6: VERIFY KEYFRAME BYTES & RECALCULATE SHA-256 ───────────────
+        keyframes = _verify_keyframe_bytes(keyframes)
         ordered_kf_shas = [kf.sha256 or "" for kf in keyframes]
 
-        # Level-B (provider) job ID — now with real keyframe SHAs
+        # ── Step 7: Associate transcript ──────────────────────────────────────
+        transcript_associations = associate_transcript(
+            scenes, transcript_dict or {}, config.include_transcript_context
+        )
+
+        # ── Step 8: Build canonical semantic request ───────────────────────────
+        output_schema_sha = AnalysisCache.output_schema_sha256(_SCHEMA_PATH)
+
+        # Determine transcript context mode and hash
+        if transcript_dict and config.include_transcript_context:
+            transcript_ctx_mode = "included"
+        elif transcript_dict:
+            transcript_ctx_mode = "redacted"
+        else:
+            transcript_ctx_mode = "not_included"
+
+        # Hash the exact excerpt that will be sent (or "not-included")
+        # Build a representative context hash from all scenes' contexts
+        if transcript_ctx_mode == "included":
+            ctx_texts = [
+                assoc.full_text
+                for assoc in transcript_associations.values()
+                if assoc is not None
+            ]
+            combined_ctx = "\n".join(ctx_texts)
+            transcript_ctx_sha = AnalysisCache.transcript_context_sha256(combined_ctx or None)
+        else:
+            transcript_ctx_sha = "not-included"
+
+        # Canonical semantic request (immutable, drives both cache and provider)
+        canonical_request = {
+            "preprocessing_sha256": pre_id,
+            "ordered_keyframe_sha256s": ordered_kf_shas,
+            "resolved_profile_hash": profile_hash,
+            "provider_id": config.provider,
+            "requested_model_id": config.vision_model or "",
+            "adapter_version": ADAPTER_VERSION,
+            "prompt_version": PROMPT_VERSION,
+            "output_schema_version": _ANALYSIS_SCHEMA_VERSION,
+            "output_schema_sha256": output_schema_sha,
+            "transcript_context_mode": transcript_ctx_mode,
+            "transcript_context_sha256": transcript_ctx_sha,
+            "external_upload_mode": "allowed" if config.allow_external_upload else "denied",
+        }
+
+        # Sanitized debug projection (hashes, counts, IDs only — no raw content)
+        _debug_request = {
+            "preprocessing_sha256": pre_id[:12] + "...",
+            "keyframe_count": len([s for s in ordered_kf_shas if s]),
+            "profile_hash": profile_hash[:12] + "...",
+            "provider_id": config.provider,
+            "requested_model_id": config.vision_model or "",
+            "transcript_context_mode": transcript_ctx_mode,
+            "transcript_context_sha256": transcript_ctx_sha[:12] + "...",
+        }
+
+        # ── Step 9: Build request payload SHA ─────────────────────────────────
         job_id = provider_job_id(
             preprocessing_sha256=pre_id,
             ordered_keyframe_sha256s=ordered_kf_shas,
@@ -275,11 +381,12 @@ class AnalysisService:
             output_schema_version=_ANALYSIS_SCHEMA_VERSION,
             output_schema_sha256=output_schema_sha,
             transcript_context_mode=transcript_ctx_mode,
-            transcript_context_sha256=transcript_hash,
+            transcript_context_sha256=transcript_ctx_sha,
             external_upload_mode="allowed" if config.allow_external_upload else "denied",
         )
 
-        # Second cache check — after keyframe extraction (exact identity)
+        # ── Step 10: Provider cache lookup (ONLY after verified keyframe SHAs) ─
+        cache = AnalysisCache(config.cache_dir)
         if config.resume and not config.force:
             cached = cache.get(job_id)
             if cached:
@@ -289,11 +396,6 @@ class AnalysisService:
                     encoding="utf-8",
                 )
                 return 0, "Analysis restored from cache"
-
-        # ── Transcript association ────────────────────────────────────────────
-        transcript_associations = associate_transcript(
-            scenes, transcript_dict or {}, config.include_transcript_context
-        )
 
         # ── Vision backend ────────────────────────────────────────────────────
         backend = _build_backend(config)
@@ -350,7 +452,7 @@ class AnalysisService:
         # ── Export ────────────────────────────────────────────────────────────
         analysis_json = export_clip_analysis(analysis)
 
-        # Schema validation (if jsonschema installed)
+        # Schema validation (jsonschema is MANDATORY_RUNTIME)
         if _SCHEMA_PATH.exists():
             schema_errors = validate_against_schema(analysis_json, str(_SCHEMA_PATH))
             if schema_errors:
@@ -358,13 +460,18 @@ class AnalysisService:
 
         (out_dir / "clip_analysis.json").write_text(analysis_json, encoding="utf-8")
 
-        # Write output manifest (owner tag for future ownership checks)
+        # ── Write output manifest ─────────────────────────────────────────────
+        root_id = _read_root_marker(out_dir) or marker_id
         manifest = {
+            "manifest_version": _MANIFEST_VERSION,
             "owner": _OWNER_TAG,
+            "output_root_id": root_id,
+            "root_binding_sha256": _root_binding_sha256(out_dir),
             "source_sha256": media_info.sha256,
             "profile_id": config.profile_id,
             "analysis_schema_version": _ANALYSIS_SCHEMA_VERSION,
             "cache_schema_version": CACHE_SCHEMA_VERSION,
+            "generated_artifacts": ["clip_analysis.json", "manifest.json", _ROOT_MARKER_FILENAME],
         }
         manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
 

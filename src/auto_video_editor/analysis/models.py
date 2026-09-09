@@ -114,7 +114,8 @@ class SceneScore:
     # score_coverage_percent: sum of weights of SCORED dimensions (0–100)
     score_coverage_percent: float
     # partial_weighted_score: sum(score * weight / 100) for scored dims only [0–100]
-    partial_weighted_score: float | None
+    # Always numeric. 0.0 when no dims are scored (zero coverage).
+    partial_weighted_score: float
     # weighted_score: = partial_weighted_score ONLY when score_coverage_percent == 100, else null
     weighted_score: float | None
     keyframes_used: int              # number of keyframes that contributed

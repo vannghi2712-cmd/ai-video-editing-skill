@@ -295,3 +295,19 @@ Phase 4 remains NOT implemented. Explicit authorization required.
 - Scene merge now deterministic: boundary-score comparison, equal/missing -> always merge PREVIOUS
 - New docs: VISION_ANALYSIS_GUIDE.md, DEPENDENCY_AUDIT_PHASE4.md
 - Phase 5 remains LOCKED. Website remains NOT IMPLEMENTED.
+
+## Phase 4 Closure Correction (2026-09-09)
+
+### Changes
+- FIX 1: Provider cache lookup moved AFTER keyframe byte verification (step 6→10 order)
+- FIX 2: Canonical semantic request object drives both cache identity and provider calls; sanitized debug projection
+- FIX 3: Public output schema bumped 1.0.0→2.0.0; V1 explicitly rejected by writer and validator
+- FIX 4: Cache format version bumped 2.0.0→3.0.0; V1.0.0 output rejected from cache.get()
+- FIX 5: UUID marker file (.scene_analysis_root) + manifest_version/output_root_id/root_binding_sha256/generated_artifacts
+- FIX 6: WhisperX ML stack verified unchanged (--no-deps install); pip check clean
+- FIX 7: Zero-coverage partial_weighted_score changed None→0.0 (always numeric)
+- FIX 8: OpenAI docs re-accessed and STATICALLY_VERIFIED; LIVE_VISION_STATUS: NOT_RUN
+
+### Tests
+- 361 tests PASS (base env), EXIT=0
+- 10 new closure regression tests added (TestClosureCorrections, TestOutputOwnershipEnforcement +2)

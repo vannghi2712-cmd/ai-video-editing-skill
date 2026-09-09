@@ -252,7 +252,7 @@ def _build_scene_score(
         and 0.0 <= d.score <= 100.0
     ]
     score_coverage_percent = float(sum(d.weight for d in scored_dims))
-    partial_ws = round(sum(d.score * d.weight / 100.0 for d in scored_dims), 4) if scored_dims else None
+    partial_ws = round(sum(d.score * d.weight / 100.0 for d in scored_dims), 4) if scored_dims else 0.0
     weighted_score = partial_ws if score_coverage_percent == 100.0 else None
 
     return SceneScore(
@@ -277,7 +277,7 @@ def _make_insufficient(scene: Scene, model: str, kf_used: int) -> SceneScore:
         prompt_version=PROMPT_VERSION,
         dimensions=(),
         score_coverage_percent=0.0,
-        partial_weighted_score=None,
+        partial_weighted_score=0.0,  # numeric zero, not null
         weighted_score=None,
         keyframes_used=kf_used,
         status="insufficient_evidence",

@@ -52,7 +52,7 @@ class MockVisionBackend:
                 prompt_version=PROMPT_VERSION,
                 dimensions=dims,
                 score_coverage_percent=0.0,
-                partial_weighted_score=None,
+                partial_weighted_score=0.0,  # numeric zero, not null
                 weighted_score=None,
                 keyframes_used=0,
                 status="insufficient_evidence",

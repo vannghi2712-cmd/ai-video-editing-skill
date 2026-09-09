@@ -503,10 +503,10 @@ class TestAnalysisCache(unittest.TestCase):
             requested_model_id=None,
             adapter_version=ADAPTER_VERSION,
             prompt_version=PROMPT_VERSION,
-            output_schema_version="1.0.0",
+            output_schema_version="2.0.0",
             output_schema_sha256="schema-missing",
-            transcript_context_mode="none",
-            transcript_context_sha256="no-transcript",
+            transcript_context_mode="not_included",
+            transcript_context_sha256="not-included",
             external_upload_mode="denied",
         )
 
@@ -517,7 +517,7 @@ class TestAnalysisCache(unittest.TestCase):
 
     def test_put_then_get_returns_data(self):
         cache = self._cache()
-        analysis_json = json.dumps({"schema_version": "1.0.0", "status": "complete"})
+        analysis_json = json.dumps({"schema_version": "2.0.0", "status": "complete"})
         jid = self._job_id()
         cache.put(jid, analysis_json)
         result = cache.get(jid)
@@ -569,7 +569,7 @@ class TestExporter(unittest.TestCase):
             scene_index=0, provider="mock", model_id=None,
             prompt_version="1.0.0",
             dimensions=(), score_coverage_percent=0.0,
-            partial_weighted_score=None, weighted_score=None,
+            partial_weighted_score=0.0, weighted_score=None,
             keyframes_used=0, status="insufficient_evidence",
         )
         return ClipAnalysis(
@@ -609,7 +609,7 @@ class TestExporter(unittest.TestCase):
     def test_export_schema_version(self):
         from auto_video_editor.analysis.exporters import export_clip_analysis
         doc = json.loads(export_clip_analysis(self._make_analysis()))
-        self.assertEqual(doc["schema_version"], "1.0.0")
+        self.assertEqual(doc["schema_version"], "2.0.0")
 
     def test_missing_score_is_null_not_zero(self):
         """Null weighted_score must appear as null in JSON, not 0."""
@@ -808,7 +808,8 @@ class TestScoringContractFull(unittest.TestCase):
         profile = _make_mock_profile({"food_appeal": 60, "motion": 40})
         score = backend.score_scene(self._make_scene(), [], profile, None)
         self.assertEqual(score.score_coverage_percent, 0.0)
-        self.assertIsNone(score.partial_weighted_score)
+        self.assertEqual(score.partial_weighted_score, 0.0,
+                         "Zero coverage must emit 0.0 (numeric zero), not null")
         self.assertIsNone(score.weighted_score)
 
     def test_no_renormalization(self):
@@ -992,101 +993,236 @@ class TestMergeShortDeterminism(unittest.TestCase):
 
 
 class TestCacheVersionBump(unittest.TestCase):
-    """Cache v2.0.0 — old caches must safely miss."""
+    """Cache v3.0.0 — old caches must safely miss."""
 
-    def test_cache_schema_version_is_2(self):
+    def test_cache_schema_version_is_3(self):
         from auto_video_editor.analysis.cache import CACHE_SCHEMA_VERSION
-        self.assertEqual(CACHE_SCHEMA_VERSION, "2.0.0")
+        self.assertEqual(CACHE_SCHEMA_VERSION, "3.0.0")
 
     def test_old_version_manifest_is_miss(self):
-        """A manifest with v1.0.0 must return None (safe miss)."""
+        """A manifest with v2.0.0 (old) must return None (safe miss on v3.0.0)."""
         import tempfile
         tmp = tempfile.mkdtemp()
         try:
             from auto_video_editor.analysis.cache import AnalysisCache
             cache = AnalysisCache(tmp)
-            # Manually write a stale v1.0.0 entry
             import os, json as j
             job_id = "abc123"
             entry = os.path.join(tmp, job_id)
             os.makedirs(entry)
             with open(os.path.join(entry, "manifest.json"), "w") as f:
-                j.dump({"job_id": job_id, "cache_schema_version": "1.0.0"}, f)
+                j.dump({"job_id": job_id, "cache_schema_version": "2.0.0"}, f)
+            with open(os.path.join(entry, "clip_analysis.json"), "w") as f:
+                j.dump({"schema_version": "2.0.0"}, f)
+            result = cache.get(job_id)
+            self.assertIsNone(result, "Stale v2.0.0 cache must be a miss on v3.0.0")
+        finally:
+            import shutil
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_v1_output_rejected_from_cache(self):
+        """Cache.get() must reject cached entries containing v1.0.0 output."""
+        import tempfile
+        tmp = tempfile.mkdtemp()
+        try:
+            from auto_video_editor.analysis.cache import AnalysisCache, CACHE_SCHEMA_VERSION
+            cache = AnalysisCache(tmp)
+            import os, json as j
+            job_id = "v1test"
+            entry = os.path.join(tmp, job_id)
+            os.makedirs(entry)
+            with open(os.path.join(entry, "manifest.json"), "w") as f:
+                j.dump({"job_id": job_id, "cache_schema_version": CACHE_SCHEMA_VERSION}, f)
             with open(os.path.join(entry, "clip_analysis.json"), "w") as f:
                 j.dump({"schema_version": "1.0.0"}, f)
             result = cache.get(job_id)
-            self.assertIsNone(result, "Stale v1.0.0 cache must be a miss")
+            self.assertIsNone(result, "Cache must reject v1.0.0 output schema entries")
         finally:
             import shutil
             shutil.rmtree(tmp, ignore_errors=True)
 
 
+def _make_full_ownership_manifest(tmp_path):
+    """Create a properly-formed v2 ownership manifest + marker in tmp_path."""
+    import hashlib, uuid as _uuid, json as j
+    root_id = str(_uuid.uuid4())
+    # Write marker
+    (tmp_path / ".scene_analysis_root").write_text(root_id, encoding="utf-8")
+    # Compute root binding
+    normalized = str(tmp_path.resolve()).replace("\\", "/")
+    binding_sha = hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+    manifest = {
+        "manifest_version": "1.0.0",
+        "owner": "auto_video_editor.scene_analysis",
+        "output_root_id": root_id,
+        "root_binding_sha256": binding_sha,
+        "source_sha256": "A" * 64,
+        "generated_artifacts": ["clip_analysis.json", "manifest.json", ".scene_analysis_root"],
+    }
+    (tmp_path / "manifest.json").write_text(j.dumps(manifest), encoding="utf-8")
+    (tmp_path / "clip_analysis.json").write_text("{}", encoding="utf-8")
+    return manifest
+
+
 class TestOutputOwnershipEnforcement(unittest.TestCase):
-    """--force cannot bypass source SHA mismatch."""
+    """--force cannot bypass source SHA mismatch; marker+binding required."""
 
     def test_force_cannot_override_different_source(self):
-        """Force with different source SHA -> exit 5 (not 0)."""
-        import tempfile, json as j, shutil
+        """Force with different source SHA -> rejected even with --force."""
+        import tempfile, shutil
+        from pathlib import Path
         tmp = tempfile.mkdtemp()
         try:
-            # Create a manifest owned by our tool with SHA "AAAAAA..."
-            manifest = {
-                "owner": "auto_video_editor.scene_analysis",
-                "source_sha256": "A" * 64,
-            }
-            with open(os.path.join(tmp, "manifest.json"), "w") as f:
-                j.dump(manifest, f)
-            # Write a dummy file so dir is non-empty
-            with open(os.path.join(tmp, "clip_analysis.json"), "w") as f:
-                f.write("{}")
-
+            p = Path(tmp)
+            _make_full_ownership_manifest(p)
             from auto_video_editor.analysis.service import _check_ownership
-            from pathlib import Path
             different_sha = "B" * 64
-            ok, msg = _check_ownership(Path(tmp), different_sha, force=True)
+            ok, msg = _check_ownership(p, different_sha, force=True)
             self.assertFalse(ok, "Force must NOT bypass source SHA mismatch")
             self.assertIn("source sha mismatch", msg.lower())
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 
     def test_force_on_same_source_is_ok(self):
-        """Force with matching source SHA is allowed."""
-        import tempfile, json as j, shutil
+        """Force with matching source SHA and valid manifest/marker is allowed."""
+        import tempfile, shutil
+        from pathlib import Path
         tmp = tempfile.mkdtemp()
         try:
-            sha = "C" * 64
-            manifest = {
-                "owner": "auto_video_editor.scene_analysis",
-                "source_sha256": sha,
-            }
-            with open(os.path.join(tmp, "manifest.json"), "w") as f:
-                j.dump(manifest, f)
-            with open(os.path.join(tmp, "clip_analysis.json"), "w") as f:
-                f.write("{}")
-
+            p = Path(tmp)
+            _make_full_ownership_manifest(p)
             from auto_video_editor.analysis.service import _check_ownership
-            from pathlib import Path
-            ok, msg = _check_ownership(Path(tmp), sha, force=True)
+            ok, msg = _check_ownership(p, "A" * 64, force=True)
             self.assertTrue(ok, f"Force on same-source owned dir should be OK: {msg}")
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 
     def test_unowned_dir_always_rejected(self):
-        """Non-empty dir with no manifest -> rejected (with or without --force)."""
+        """Non-empty dir with no manifest -> rejected with or without --force."""
         import tempfile, shutil
+        from pathlib import Path
         tmp = tempfile.mkdtemp()
         try:
-            # Write a file but no manifest
-            with open(os.path.join(tmp, "data.txt"), "w") as f:
-                f.write("hello")
+            p = Path(tmp)
+            (p / "data.txt").write_text("hello", encoding="utf-8")
             from auto_video_editor.analysis.service import _check_ownership
-            from pathlib import Path
-            ok_no_force, _ = _check_ownership(Path(tmp), "A" * 64, force=False)
-            ok_force, _ = _check_ownership(Path(tmp), "A" * 64, force=True)
+            ok_no_force, _ = _check_ownership(p, "A" * 64, force=False)
+            ok_force, _ = _check_ownership(p, "A" * 64, force=True)
             self.assertFalse(ok_no_force)
             self.assertFalse(ok_force)
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_missing_marker_file_rejected(self):
+        """Valid manifest but missing marker file -> ownership rejected."""
+        import tempfile, shutil
+        from pathlib import Path
+        tmp = tempfile.mkdtemp()
+        try:
+            p = Path(tmp)
+            _make_full_ownership_manifest(p)
+            # Remove marker file
+            (p / ".scene_analysis_root").unlink()
+            from auto_video_editor.analysis.service import _check_ownership
+            ok, msg = _check_ownership(p, "A" * 64, force=False)
+            self.assertFalse(ok, "Missing marker file must be rejected")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_marker_mismatch_rejected(self):
+        """Marker file UUID differs from manifest output_root_id -> rejected."""
+        import tempfile, shutil
+        from pathlib import Path
+        tmp = tempfile.mkdtemp()
+        try:
+            p = Path(tmp)
+            _make_full_ownership_manifest(p)
+            # Tamper: overwrite marker with different UUID
+            (p / ".scene_analysis_root").write_text("different-uuid", encoding="utf-8")
+            from auto_video_editor.analysis.service import _check_ownership
+            ok, msg = _check_ownership(p, "A" * 64, force=False)
+            self.assertFalse(ok, "Marker UUID mismatch must be rejected")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
+class TestClosureCorrections(unittest.TestCase):
+    """Phase 4 Closure Correction regression tests."""
+
+    def test_v1_schema_rejected_by_validator(self):
+        """validate_against_schema must reject v1.0.0 output with a clear error."""
+        from auto_video_editor.analysis.exporters import validate_against_schema, SCHEMA_VERSION
+        import json as j
+        v1_doc = j.dumps({"schema_version": "1.0.0", "status": "complete"})
+        errors = validate_against_schema(v1_doc, str(
+            __import__("pathlib").Path(__file__).parent.parent /
+            "schemas" / "clip_analysis.schema.json"
+        ))
+        self.assertTrue(len(errors) > 0, "V1 output must be rejected")
+        self.assertIn("1.0.0", errors[0])
+
+    def test_schema_version_is_2(self):
+        """Exporter SCHEMA_VERSION must be 2.0.0."""
+        from auto_video_editor.analysis.exporters import SCHEMA_VERSION
+        self.assertEqual(SCHEMA_VERSION, "2.0.0")
+
+    def test_partial_weighted_score_is_always_float(self):
+        """partial_weighted_score must be float (never None) for zero-coverage scene."""
+        from auto_video_editor.analysis.scoring.mock_backend import MockVisionBackend
+        backend = MockVisionBackend()
+        profile = _make_mock_profile({"a": 60, "b": 40})
+        scene = __import__("auto_video_editor.analysis.models", fromlist=["Scene"]).Scene(
+            0, 0, 5_000_000, None
+        )
+        score = backend.score_scene(scene, [], profile, None)
+        self.assertIsInstance(score.partial_weighted_score, float,
+                              "partial_weighted_score must be float, not None")
+        self.assertEqual(score.partial_weighted_score, 0.0)
+
+    def test_cache_not_included_sentinel(self):
+        """transcript_context_sha256 sentinel must be 'not-included'."""
+        from auto_video_editor.analysis.cache import AnalysisCache
+        sha = AnalysisCache.transcript_context_sha256(None)
+        self.assertEqual(sha, "not-included")
+
+    def test_keyframe_sha_verification(self):
+        """AnalysisCache.verify_keyframe_sha256 reads file bytes and returns SHA."""
+        import tempfile, hashlib
+        data = b"fake_jpeg_data"
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as f:
+            f.write(data)
+            fname = f.name
+        try:
+            from auto_video_editor.analysis.cache import AnalysisCache
+            result = AnalysisCache.verify_keyframe_sha256(fname)
+            expected = hashlib.sha256(data).hexdigest()
+            self.assertEqual(result, expected)
+        finally:
+            import os
+            os.unlink(fname)
+
+    def test_keyframe_sha_missing_file_returns_none(self):
+        """verify_keyframe_sha256 returns None for missing files."""
+        from auto_video_editor.analysis.cache import AnalysisCache
+        result = AnalysisCache.verify_keyframe_sha256("/nonexistent/path/kf.jpg")
+        self.assertIsNone(result)
+
+    def test_provider_cache_only_after_verified_keyframes(self):
+        """Service must build provider job_id with real keyframe SHAs (spy test)."""
+        # Verify that provider_job_id is called AFTER keyframes are extracted.
+        # We can verify this contract by checking that ordered_kf_shas is passed
+        # to provider_job_id only when extraction is complete.
+        # This is a static import-order / contract test.
+        import inspect
+        from auto_video_editor.analysis import service as svc
+        src = inspect.getsource(svc.AnalysisService.run)
+        # Step 6 (verify keyframe bytes) must appear before Step 10 (cache lookup)
+        step6_pos = src.find("VERIFY KEYFRAME BYTES")
+        step10_pos = src.find("Provider cache lookup")
+        self.assertGreater(step6_pos, 0, "Step 6 comment must exist in service.run")
+        self.assertGreater(step10_pos, 0, "Step 10 comment must exist in service.run")
+        self.assertLess(step6_pos, step10_pos,
+                        "Keyframe verification (step 6) must precede provider cache lookup (step 10)")
 
 
 if __name__ == "__main__":

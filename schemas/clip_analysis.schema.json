@@ -1,8 +1,8 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://auto-video-editor/schemas/clip_analysis/1.0.0",
+  "$id": "https://auto-video-editor/schemas/clip_analysis/2.0.0",
   "title": "ClipAnalysis",
-  "description": "Phase 4 scene analysis output. Draft 2020-12. Version 1.0.0.",
+  "description": "Phase 4 scene analysis output. Draft 2020-12. Version 2.0.0. V1 is rejected.",
   "type": "object",
   "required": [
     "schema_version", "status", "source", "profile",
@@ -13,7 +13,7 @@
   "properties": {
     "schema_version": {
       "type": "string",
-      "const": "1.0.0"
+      "const": "2.0.0"
     },
     "status": {
       "type": "string",
@@ -82,7 +82,7 @@
           "prompt_version": {"type": "string"},
           "status": {"type": "string", "enum": ["scored", "insufficient_evidence", "failed"]},
           "score_coverage_percent": {"type": "number", "minimum": 0, "maximum": 100},
-          "partial_weighted_score": {"type": ["number", "null"], "minimum": 0, "maximum": 100},
+          "partial_weighted_score": {"type": "number", "minimum": 0, "maximum": 100},
           "weighted_score": {"type": ["number", "null"], "minimum": 0, "maximum": 100},
           "keyframes_used": {"type": "integer", "minimum": 0},
           "dimensions": {
