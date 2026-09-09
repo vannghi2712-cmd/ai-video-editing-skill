@@ -2,20 +2,26 @@
 
 No hard-coded profile-ID branches.
 No shell=True. No GPU/CUDA.
+Ownership contract: --force does NOT bypass source ownership check.
 """
 from __future__ import annotations
 
-import hashlib
 import json
 import time
 from pathlib import Path
 
-from auto_video_editor.analysis.cache import AnalysisCache
+from auto_video_editor.analysis.cache import (
+    ADAPTER_VERSION,
+    CACHE_SCHEMA_VERSION,
+    AnalysisCache,
+    preprocessing_job_id,
+    provider_job_id,
+)
 from auto_video_editor.analysis.config import AnalysisConfig
 from auto_video_editor.analysis.exporters import export_clip_analysis, validate_against_schema
 from auto_video_editor.analysis.keyframe_extractor import extract_keyframes
 from auto_video_editor.analysis.media_inspector import inspect_media
-from auto_video_editor.analysis.models import ClipAnalysis, Scene
+from auto_video_editor.analysis.models import ClipAnalysis
 from auto_video_editor.analysis.scene_detector import detect_scenes
 from auto_video_editor.analysis.scoring.base import PROMPT_VERSION
 from auto_video_editor.analysis.transcript_associator import (
@@ -28,6 +34,84 @@ _SCHEMA_PATH = (
     Path(__file__).parent.parent.parent.parent / "schemas" / "clip_analysis.schema.json"
 )
 _ANALYSIS_SCHEMA_VERSION = "1.0.0"
+_OWNER_TAG = "auto_video_editor.scene_analysis"
+
+# FFmpeg/FFprobe version placeholders — detected at runtime when available.
+_TOOL_VERSION_UNKNOWN = "unknown"
+
+
+def _get_tool_version(tool: str) -> str:
+    """Get FFmpeg/FFprobe version string without shell=True."""
+    import subprocess  # noqa: PLC0415
+    try:
+        r = subprocess.run(
+            [tool, "-version"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        first_line = (r.stdout or r.stderr or b"").decode("utf-8", errors="replace").splitlines()
+        return first_line[0].strip() if first_line else _TOOL_VERSION_UNKNOWN
+    except Exception:  # noqa: BLE001
+        return _TOOL_VERSION_UNKNOWN
+
+
+def _check_ownership(out_dir: Path, source_sha256: str, force: bool) -> tuple[bool, str]:
+    """
+    Check output directory ownership.
+
+    Rules (--force does NOT bypass source ownership):
+    - Directory does not exist: OK
+    - Directory exists but is empty: OK
+    - Directory has valid manifest owned by _OWNER_TAG with matching source_sha256: OK
+    - Directory has manifest owned by _OWNER_TAG but different source_sha256: FAIL (even with --force)
+    - Directory has no manifest but is non-empty: FAIL
+    - Manifest exists but unreadable or unknown owner: FAIL
+
+    Returns (ok: bool, error_message: str)
+    """
+    if not out_dir.exists():
+        return True, ""
+
+    # Reject symlinks and traversal attempts
+    try:
+        resolved = out_dir.resolve()
+        if out_dir != resolved and not str(resolved).startswith(str(out_dir.parent.resolve())):
+            return False, "Output dir resolves outside expected parent (symlink escape)."
+    except Exception:  # noqa: BLE001
+        pass
+
+    # Empty dir is always OK
+    children = list(out_dir.iterdir())
+    if not children:
+        return True, ""
+
+    manifest_path = out_dir / "manifest.json"
+    if not manifest_path.exists():
+        return False, (
+            "Output dir is non-empty but has no manifest.json. "
+            "Use a different --output-dir or clear the directory manually."
+        )
+
+    try:
+        existing = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001
+        return False, "Output dir has an unreadable manifest.json. Cannot safely overwrite."
+
+    owner = existing.get("owner", "")
+    if owner != _OWNER_TAG:
+        return False, (
+            f"Output dir is owned by '{owner or 'unknown'}', not '{_OWNER_TAG}'. "
+            "Use a different --output-dir."
+        )
+
+    existing_src = existing.get("source_sha256", "")
+    if existing_src and existing_src != source_sha256:
+        return False, (
+            "Output dir is owned by a different source file (source SHA mismatch). "
+            "--force cannot override a different-source directory. Use a different --output-dir."
+        )
+
+    # Owned by us and matching source: OK (--force may replace declared artifacts)
+    return True, ""
 
 
 class AnalysisService:
@@ -38,7 +122,7 @@ class AnalysisService:
 
         Returns (exit_code, message).
         exit_code semantics match CLI contract:
-          0=success, 3=profile, 4=media, 5=schema, 6=consent, 7=partial, 8=backend
+          0=success, 3=profile, 4=media, 5=schema/output, 6=consent, 7=partial, 8=backend
         """
         t_start = time.monotonic()
         warnings: list[str] = []
@@ -87,27 +171,19 @@ class AnalysisService:
                 except Exception:  # noqa: BLE001
                     pass
             print(
-                f"DRY_RUN — Estimated: ~{est_scenes} scenes, "
+                f"DRY_RUN - Estimated: ~{est_scenes} scenes, "
                 f"~{est_kf} keyframes (~{est_kf_bytes//1024}KB), "
                 f"{est_api_calls} API calls, "
                 f"{transcript_chars} transcript chars"
             )
             return 0, "Dry-run complete"
 
-        # ── Output directory ownership ────────────────────────────────────────
+        # ── Output directory ownership (--force does NOT bypass) ──────────────
         out_dir.mkdir(parents=True, exist_ok=True)
+        ok, err_msg = _check_ownership(out_dir, media_info.sha256, config.force)
+        if not ok:
+            return 5, err_msg
         manifest_path = out_dir / "manifest.json"
-        if manifest_path.exists() and not config.force:
-            try:
-                existing = json.loads(manifest_path.read_text(encoding="utf-8"))
-                existing_src = existing.get("source_sha256", "")
-                if existing_src and existing_src != media_info.sha256:
-                    return 5, (
-                        f"Output dir owned by different job (source SHA mismatch). "
-                        "Use --force to overwrite."
-                    )
-            except Exception:  # noqa: BLE001
-                return 5, "Output dir has unreadable manifest. Use --force to overwrite."
 
         # ── Transcript ────────────────────────────────────────────────────────
         transcript_dict: dict | None = None
@@ -118,6 +194,20 @@ class AnalysisService:
                 warnings.append(f"Transcript load failed: {exc}")
 
         transcript_hash = AnalysisCache.transcript_hash(transcript_dict)
+
+        # ── Tool versions (for cache identity) ───────────────────────────────
+        ffmpeg_version = _get_tool_version("ffmpeg")
+        ffprobe_version = _get_tool_version("ffprobe")
+
+        # Level-A (preprocessing) cache identity
+        pre_id = preprocessing_job_id(
+            source_sha256=media_info.sha256,
+            ffmpeg_version=ffmpeg_version,
+            ffprobe_version=ffprobe_version,
+            scene_detector_config=config.detector.as_dict(),
+            extractor_slots=config.keyframe_slots,
+            extractor_max_dim=1280,
+        )
 
         # ── Scene detection ───────────────────────────────────────────────────
         try:
@@ -130,12 +220,30 @@ class AnalysisService:
 
         # ── Cache check (resume) — BEFORE keyframe extraction ─────────────────
         cache = AnalysisCache(config.cache_dir)
+        output_schema_sha = AnalysisCache.output_schema_sha256(_SCHEMA_PATH)
+        transcript_ctx_mode = (
+            "included" if (transcript_dict and config.include_transcript_context)
+            else ("redacted" if transcript_dict else "none")
+        )
+
         if config.resume and not config.force:
-            cached = cache.get(
-                media_info.sha256, config.detector.as_dict(),
-                profile_hash, transcript_hash,
-                config.provider, config.vision_model, PROMPT_VERSION,
+            # We don't have keyframe SHAs yet — do a pre-check with empty list
+            # (will be confirmed after extraction)
+            pre_job_id = provider_job_id(
+                preprocessing_sha256=pre_id,
+                ordered_keyframe_sha256s=[],
+                resolved_profile_hash=profile_hash,
+                provider_id=config.provider,
+                requested_model_id=config.vision_model,
+                adapter_version=ADAPTER_VERSION,
+                prompt_version=PROMPT_VERSION,
+                output_schema_version=_ANALYSIS_SCHEMA_VERSION,
+                output_schema_sha256=output_schema_sha,
+                transcript_context_mode=transcript_ctx_mode,
+                transcript_context_sha256=transcript_hash,
+                external_upload_mode="allowed" if config.allow_external_upload else "denied",
             )
+            cached = cache.get(pre_job_id)
             if cached:
                 print("Cache hit (OK) -- restoring from cache")
                 (out_dir / "clip_analysis.json").write_text(
@@ -152,6 +260,35 @@ class AnalysisService:
         except Exception as exc:  # noqa: BLE001
             return 8, f"Keyframe extraction failed: {exc}"
         warnings.extend(kf_warnings)
+
+        ordered_kf_shas = [kf.sha256 or "" for kf in keyframes]
+
+        # Level-B (provider) job ID — now with real keyframe SHAs
+        job_id = provider_job_id(
+            preprocessing_sha256=pre_id,
+            ordered_keyframe_sha256s=ordered_kf_shas,
+            resolved_profile_hash=profile_hash,
+            provider_id=config.provider,
+            requested_model_id=config.vision_model,
+            adapter_version=ADAPTER_VERSION,
+            prompt_version=PROMPT_VERSION,
+            output_schema_version=_ANALYSIS_SCHEMA_VERSION,
+            output_schema_sha256=output_schema_sha,
+            transcript_context_mode=transcript_ctx_mode,
+            transcript_context_sha256=transcript_hash,
+            external_upload_mode="allowed" if config.allow_external_upload else "denied",
+        )
+
+        # Second cache check — after keyframe extraction (exact identity)
+        if config.resume and not config.force:
+            cached = cache.get(job_id)
+            if cached:
+                print("Cache hit (OK) -- restoring from cache")
+                (out_dir / "clip_analysis.json").write_text(
+                    json.dumps(cached["analysis"], indent=2, ensure_ascii=False),
+                    encoding="utf-8",
+                )
+                return 0, "Analysis restored from cache"
 
         # ── Transcript association ────────────────────────────────────────────
         transcript_associations = associate_transcript(
@@ -202,9 +339,11 @@ class AnalysisService:
             },
             provenance={
                 "analysis_schema_version": _ANALYSIS_SCHEMA_VERSION,
+                "cache_schema_version": CACHE_SCHEMA_VERSION,
                 "provider": config.provider,
                 "model_id": config.vision_model,
                 "prompt_version": PROMPT_VERSION,
+                "adapter_version": ADAPTER_VERSION,
             },
         )
 
@@ -219,20 +358,24 @@ class AnalysisService:
 
         (out_dir / "clip_analysis.json").write_text(analysis_json, encoding="utf-8")
 
-        # Write output manifest
+        # Write output manifest (owner tag for future ownership checks)
         manifest = {
+            "owner": _OWNER_TAG,
             "source_sha256": media_info.sha256,
             "profile_id": config.profile_id,
             "analysis_schema_version": _ANALYSIS_SCHEMA_VERSION,
+            "cache_schema_version": CACHE_SCHEMA_VERSION,
         }
         manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
 
         # ── Cache store ───────────────────────────────────────────────────────
         cache.put(
-            media_info.sha256, config.detector.as_dict(),
-            profile_hash, transcript_hash,
-            config.provider, config.vision_model, PROMPT_VERSION,
+            job_id,
             analysis_json,
+            extra_manifest={
+                "source_sha256": media_info.sha256,
+                "provider_id": config.provider,
+            },
         )
 
         n_scenes = len(scenes)
@@ -248,7 +391,7 @@ class AnalysisService:
                 print(f"  WARNING: {w}")
 
         if overall_status == "partial":
-            return 7, f"Partial — {backend_errors}/{n_scenes} scenes failed scoring"
+            return 7, f"Partial - {backend_errors}/{n_scenes} scenes failed scoring"
         if overall_status == "failed":
             return 8, "All scenes failed scoring"
         return 0, "Success"

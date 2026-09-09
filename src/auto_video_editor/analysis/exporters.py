@@ -86,6 +86,8 @@ def _score_dict(sc: SceneScore) -> dict:
         "model_id": sc.model_id,
         "prompt_version": sc.prompt_version,
         "status": sc.status,
+        "score_coverage_percent": sc.score_coverage_percent,
+        "partial_weighted_score": sc.partial_weighted_score,
         "weighted_score": sc.weighted_score,
         "keyframes_used": sc.keyframes_used,
         "dimensions": [

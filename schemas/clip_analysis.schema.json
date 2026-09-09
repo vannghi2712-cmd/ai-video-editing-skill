@@ -73,7 +73,7 @@
       "type": "array",
       "items": {
         "type": "object",
-        "required": ["scene_index", "provider", "model_id", "prompt_version", "status", "weighted_score", "keyframes_used", "dimensions"],
+        "required": ["scene_index", "provider", "model_id", "prompt_version", "status", "score_coverage_percent", "partial_weighted_score", "weighted_score", "keyframes_used", "dimensions"],
         "additionalProperties": false,
         "properties": {
           "scene_index": {"type": "integer", "minimum": 0},
@@ -81,7 +81,9 @@
           "model_id": {"type": ["string", "null"]},
           "prompt_version": {"type": "string"},
           "status": {"type": "string", "enum": ["scored", "insufficient_evidence", "failed"]},
-          "weighted_score": {"type": ["number", "null"]},
+          "score_coverage_percent": {"type": "number", "minimum": 0, "maximum": 100},
+          "partial_weighted_score": {"type": ["number", "null"], "minimum": 0, "maximum": 100},
+          "weighted_score": {"type": ["number", "null"], "minimum": 0, "maximum": 100},
           "keyframes_used": {"type": "integer", "minimum": 0},
           "dimensions": {
             "type": "array",

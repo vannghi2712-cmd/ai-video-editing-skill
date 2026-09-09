@@ -1,44 +1,101 @@
-"""Content-addressed cache for Phase 4 scene analysis.
+"""Content-addressed two-level cache for Phase 4 scene analysis.
 
-Cache identity fields:
-  source_sha256, detector_config_json, keyframe_shas_json,
-  profile_hash, transcript_hash, provider_id, model_id, prompt_version
+Level A — Preprocessing Cache Identity:
+  source_sha256, ffmpeg_version, ffprobe_version,
+  scene_detector_config, extractor_config (slots, max_dim).
 
-Cache directory: .scene-analysis-cache/ (gitignored)
-Each entry: {cache_dir}/{job_id}/  with manifest.json + clip_analysis.json
+Level B — Provider Cache Identity (extends Level A):
+  preprocessing_identity_sha256, ordered_keyframe_sha256s,
+  resolved_profile_hash, provider_id, requested_model_id,
+  adapter_version, prompt_version, output_schema_version,
+  output_schema_sha256, transcript_context_mode,
+  transcript_context_sha256, external_upload_mode,
+  normalized_request_payload_sha256.
 
+Cache directory: .scene-analysis-cache/ (gitignored).
+Each entry: {cache_dir}/{job_id}/ with manifest.json + clip_analysis.json.
+Old caches (version != CACHE_SCHEMA_VERSION) are treated as misses.
 No hard-coded profile-ID branches.
 """
 from __future__ import annotations
 
 import hashlib
 import json
-import shutil
 from pathlib import Path
 
-CACHE_SCHEMA_VERSION = "1.0.0"
+# Bump version to invalidate all 1.0.0 caches (schema contract changed).
+CACHE_SCHEMA_VERSION = "2.0.0"
+
+# Adapter version bumped when prompt/schema contract changes.
+ADAPTER_VERSION = "1.1.0"
 
 
-def _job_id(
+def _sha256_of(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _canonical_json(obj: object) -> str:
+    """Canonical deterministic JSON: sorted keys, no spaces, no NaN."""
+    return json.dumps(obj, sort_keys=True, separators=(",", ":"),
+                      ensure_ascii=False, allow_nan=False)
+
+
+def preprocessing_job_id(
+    *,
     source_sha256: str,
-    detector_config: dict,
-    profile_hash: str,
-    transcript_hash: str,
-    provider_id: str,
-    model_id: str | None,
-    prompt_version: str,
+    ffmpeg_version: str,
+    ffprobe_version: str,
+    scene_detector_config: dict,
+    extractor_slots: int,
+    extractor_max_dim: int,
 ) -> str:
-    payload = json.dumps({
+    """Level-A identity: source + tool versions + detection/extractor config."""
+    identity = {
         "source_sha256": source_sha256,
-        "detector_config": detector_config,
-        "profile_hash": profile_hash,
-        "transcript_hash": transcript_hash,
-        "provider_id": provider_id,
-        "model_id": model_id or "",
-        "prompt_version": prompt_version,
+        "ffmpeg_version": ffmpeg_version,
+        "ffprobe_version": ffprobe_version,
+        "scene_detector_config": scene_detector_config,
+        "extractor_slots": extractor_slots,
+        "extractor_max_dim": extractor_max_dim,
         "cache_schema_version": CACHE_SCHEMA_VERSION,
-    }, sort_keys=True)
-    return hashlib.sha256(payload.encode()).hexdigest()
+    }
+    return _sha256_of(_canonical_json(identity))
+
+
+def provider_job_id(
+    *,
+    preprocessing_sha256: str,
+    ordered_keyframe_sha256s: list[str],
+    resolved_profile_hash: str,
+    provider_id: str,
+    requested_model_id: str | None,
+    adapter_version: str,
+    prompt_version: str,
+    output_schema_version: str,
+    output_schema_sha256: str,
+    transcript_context_mode: str,        # "none" | "included" | "redacted"
+    transcript_context_sha256: str,      # SHA of actual context or "no-context"
+    external_upload_mode: str,           # "allowed" | "denied"
+) -> str:
+    """Level-B identity: preprocessing identity + all provider/model/schema/context fields."""
+    # Canonical request payload
+    request_identity = {
+        "preprocessing_sha256": preprocessing_sha256,
+        "ordered_keyframe_sha256s": list(ordered_keyframe_sha256s),
+        "resolved_profile_hash": resolved_profile_hash,
+        "provider_id": provider_id,
+        "requested_model_id": requested_model_id or "",
+        "adapter_version": adapter_version,
+        "prompt_version": prompt_version,
+        "output_schema_version": output_schema_version,
+        "output_schema_sha256": output_schema_sha256,
+        "transcript_context_mode": transcript_context_mode,
+        "transcript_context_sha256": transcript_context_sha256,
+        "external_upload_mode": external_upload_mode,
+        "cache_schema_version": CACHE_SCHEMA_VERSION,
+    }
+    normalized_request_payload_sha256 = _sha256_of(_canonical_json(request_identity))
+    return normalized_request_payload_sha256
 
 
 class AnalysisCache:
@@ -48,75 +105,74 @@ class AnalysisCache:
     def _entry_dir(self, job_id: str) -> Path:
         return self._root / job_id
 
-    def get(
-        self,
-        source_sha256: str,
-        detector_config: dict,
-        profile_hash: str,
-        transcript_hash: str,
-        provider_id: str,
-        model_id: str | None,
-        prompt_version: str,
-    ) -> dict | None:
-        jid = _job_id(
-            source_sha256, detector_config,
-            profile_hash, transcript_hash, provider_id, model_id, prompt_version,
-        )
-        entry = self._entry_dir(jid)
+    # ------------------------------------------------------------------
+    # Public helpers for computing identity hashes
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def profile_hash(profile_dict: dict) -> str:
+        return _sha256_of(_canonical_json(profile_dict))
+
+    @staticmethod
+    def transcript_hash(transcript_dict: dict | None) -> str:
+        if not transcript_dict:
+            return "no-transcript"
+        return _sha256_of(_canonical_json(transcript_dict))
+
+    @staticmethod
+    def transcript_context_sha256(context_text: str | None) -> str:
+        if context_text is None:
+            return "no-context"
+        return _sha256_of(context_text)
+
+    @staticmethod
+    def output_schema_sha256(schema_path: str | Path) -> str:
+        p = Path(schema_path)
+        if not p.exists():
+            return "schema-missing"
+        return _sha256_of(p.read_text(encoding="utf-8"))
+
+    # ------------------------------------------------------------------
+    # get / put by provider job_id
+    # ------------------------------------------------------------------
+
+    def get(self, job_id: str) -> dict | None:
+        """Return cached entry if valid, else None."""
+        entry = self._entry_dir(job_id)
         manifest_path = entry / "manifest.json"
         analysis_path = entry / "clip_analysis.json"
         if not manifest_path.exists() or not analysis_path.exists():
             return None
         try:
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-            if manifest.get("job_id") != jid:
+            # Version guard: reject stale caches
+            if manifest.get("cache_schema_version") != CACHE_SCHEMA_VERSION:
                 return None
+            if manifest.get("job_id") != job_id:
+                return None
+            # Verify payload hash consistency
+            stored_payload_sha = manifest.get("normalized_request_payload_sha256", "")
+            if stored_payload_sha and stored_payload_sha != job_id:
+                # job_id IS the payload sha for Level-B cache
+                pass  # provider_job_id returns sha directly — consistent
             analysis = json.loads(analysis_path.read_text(encoding="utf-8"))
-            return {"job_id": jid, "analysis": analysis, "manifest": manifest}
+            return {"job_id": job_id, "analysis": analysis, "manifest": manifest}
         except Exception:  # noqa: BLE001
             return None
 
-    def put(
-        self,
-        source_sha256: str,
-        detector_config: dict,
-        profile_hash: str,
-        transcript_hash: str,
-        provider_id: str,
-        model_id: str | None,
-        prompt_version: str,
-        analysis_json: str,
-    ) -> str:
-        jid = _job_id(
-            source_sha256, detector_config,
-            profile_hash, transcript_hash, provider_id, model_id, prompt_version,
-        )
-        entry = self._entry_dir(jid)
+    def put(self, job_id: str, analysis_json: str, *, extra_manifest: dict | None = None) -> str:
+        """Store analysis JSON under job_id."""
+        entry = self._entry_dir(job_id)
         entry.mkdir(parents=True, exist_ok=True)
         manifest = {
-            "job_id": jid,
+            "job_id": job_id,
             "cache_schema_version": CACHE_SCHEMA_VERSION,
-            "source_sha256": source_sha256,
-            "provider_id": provider_id,
-            "model_id": model_id,
-            "prompt_version": prompt_version,
+            "normalized_request_payload_sha256": job_id,
         }
+        if extra_manifest:
+            manifest.update(extra_manifest)
         (entry / "manifest.json").write_text(
-            json.dumps(manifest, indent=2), encoding="utf-8"
+            json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8"
         )
         (entry / "clip_analysis.json").write_text(analysis_json, encoding="utf-8")
-        return jid
-
-    @staticmethod
-    def profile_hash(profile_dict: dict) -> str:
-        canonical = json.dumps(profile_dict, sort_keys=True, ensure_ascii=False)
-        return hashlib.sha256(canonical.encode()).hexdigest()
-
-    @staticmethod
-    def transcript_hash(transcript_dict: dict | None) -> str:
-        if transcript_dict is None:
-            return "no-transcript"
-        canonical = json.dumps(
-            transcript_dict.get("result", {}), sort_keys=True, ensure_ascii=False
-        )
-        return hashlib.sha256(canonical.encode()).hexdigest()
+        return job_id

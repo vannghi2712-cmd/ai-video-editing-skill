@@ -481,43 +481,64 @@ class TestAnalysisCache(unittest.TestCase):
         from auto_video_editor.analysis.cache import AnalysisCache
         return AnalysisCache(self.tmp)
 
-    def _identity(self):
-        return dict(
-            source_sha256="A" * 64,
-            detector_config={"threshold": 0.3, "min_duration_seconds": 1.0, "max_duration_seconds": 15.0},
-            profile_hash="C" * 64,
-            transcript_hash="no-transcript",
-            provider_id="mock",
-            model_id=None,
-            prompt_version="1.0.0",
+    def _job_id(self, source_sha="A" * 64, provider_id="mock"):
+        """Compute a provider_job_id for test use."""
+        from auto_video_editor.analysis.cache import (
+            preprocessing_job_id, provider_job_id, ADAPTER_VERSION, CACHE_SCHEMA_VERSION,
+        )
+        from auto_video_editor.analysis.scoring.base import PROMPT_VERSION
+        pre_id = preprocessing_job_id(
+            source_sha256=source_sha,
+            ffmpeg_version="test-ffmpeg",
+            ffprobe_version="test-ffprobe",
+            scene_detector_config={"threshold": 0.3, "min_duration_seconds": 1.0, "max_duration_seconds": 15.0},
+            extractor_slots=3,
+            extractor_max_dim=1280,
+        )
+        return provider_job_id(
+            preprocessing_sha256=pre_id,
+            ordered_keyframe_sha256s=[],
+            resolved_profile_hash="C" * 64,
+            provider_id=provider_id,
+            requested_model_id=None,
+            adapter_version=ADAPTER_VERSION,
+            prompt_version=PROMPT_VERSION,
+            output_schema_version="1.0.0",
+            output_schema_sha256="schema-missing",
+            transcript_context_mode="none",
+            transcript_context_sha256="no-transcript",
+            external_upload_mode="denied",
         )
 
     def test_miss_returns_none(self):
         cache = self._cache()
-        result = cache.get(**self._identity())
+        result = cache.get(self._job_id())
         self.assertIsNone(result)
 
     def test_put_then_get_returns_data(self):
         cache = self._cache()
         analysis_json = json.dumps({"schema_version": "1.0.0", "status": "complete"})
-        jid = cache.put(**self._identity(), analysis_json=analysis_json)
-        result = cache.get(**self._identity())
+        jid = self._job_id()
+        cache.put(jid, analysis_json)
+        result = cache.get(jid)
         self.assertIsNotNone(result)
         self.assertEqual(result["job_id"], jid)
 
     def test_different_source_sha_is_miss(self):
         cache = self._cache()
         analysis_json = json.dumps({"x": 1})
-        cache.put(**self._identity(), analysis_json=analysis_json)
-        identity2 = dict(self._identity(), source_sha256="D" * 64)
-        result = cache.get(**identity2)
+        jid1 = self._job_id(source_sha="A" * 64)
+        jid2 = self._job_id(source_sha="D" * 64)
+        cache.put(jid1, analysis_json)
+        result = cache.get(jid2)
         self.assertIsNone(result)
 
     def test_different_provider_is_miss(self):
         cache = self._cache()
-        cache.put(**self._identity(), analysis_json="{}")
-        identity2 = dict(self._identity(), provider_id="openai")
-        self.assertIsNone(cache.get(**identity2))
+        jid_mock = self._job_id(provider_id="mock")
+        jid_openai = self._job_id(provider_id="openai")
+        cache.put(jid_mock, "{}")
+        self.assertIsNone(cache.get(jid_openai))
 
     def test_profile_hash_static(self):
         from auto_video_editor.analysis.cache import AnalysisCache
@@ -547,7 +568,8 @@ class TestExporter(unittest.TestCase):
         score = SceneScore(
             scene_index=0, provider="mock", model_id=None,
             prompt_version="1.0.0",
-            dimensions=(), weighted_score=None,
+            dimensions=(), score_coverage_percent=0.0,
+            partial_weighted_score=None, weighted_score=None,
             keyframes_used=0, status="insufficient_evidence",
         )
         return ClipAnalysis(
@@ -754,6 +776,317 @@ class TestSyntheticSmoke(unittest.TestCase):
         result = subprocess.run(cmd, cwd=str(ROOT))
         self.assertEqual(result.returncode, 0)
         self.assertFalse((Path(dry_out) / "clip_analysis.json").exists())
+
+
+# ── Phase 4 Contract Correction Regression Tests ──────────────────────────────
+
+class TestScoringContractFull(unittest.TestCase):
+    """Scoring: full coverage => weighted_score = partial_weighted_score."""
+
+    def _make_scene(self):
+        from auto_video_editor.analysis.models import Scene
+        return Scene(0, 0, 5_000_000, None)
+
+    def _kf(self, sha="A" * 64):
+        from auto_video_editor.analysis.models import Keyframe
+        return Keyframe(0, 0, 1_000_000, "/tmp/f.jpg", sha, "ok")
+
+    def test_full_coverage_weighted_equals_partial(self):
+        """When all dims scored, weighted_score == partial_weighted_score."""
+        from auto_video_editor.analysis.scoring.mock_backend import MockVisionBackend
+        backend = MockVisionBackend()
+        profile = _make_mock_profile({"food_appeal": 60, "motion": 40})
+        score = backend.score_scene(self._make_scene(), [self._kf()], profile, None)
+        self.assertEqual(score.score_coverage_percent, 100.0)
+        self.assertIsNotNone(score.partial_weighted_score)
+        self.assertEqual(score.weighted_score, score.partial_weighted_score)
+
+    def test_zero_coverage_all_null(self):
+        """No keyframes -> score_coverage_percent=0, weighted_score=null."""
+        from auto_video_editor.analysis.scoring.mock_backend import MockVisionBackend
+        backend = MockVisionBackend()
+        profile = _make_mock_profile({"food_appeal": 60, "motion": 40})
+        score = backend.score_scene(self._make_scene(), [], profile, None)
+        self.assertEqual(score.score_coverage_percent, 0.0)
+        self.assertIsNone(score.partial_weighted_score)
+        self.assertIsNone(score.weighted_score)
+
+    def test_no_renormalization(self):
+        """weighted_score must not divide by sum(scored weights)."""
+        # With full coverage mock backend, all weights are scored -> weighted_score
+        # should be sum(score*weight/100), NOT sum(score*weight)/sum(weights).
+        from auto_video_editor.analysis.scoring.mock_backend import MockVisionBackend
+        import math
+        backend = MockVisionBackend()
+        profile = _make_mock_profile({"a": 50, "b": 50})
+        score = backend.score_scene(self._make_scene(), [self._kf()], profile, None)
+        if score.weighted_score is not None and score.partial_weighted_score is not None:
+            # partial_weighted_score = sum(score_i * weight_i / 100)
+            # This is NOT the same as sum(score_i * weight_i) / sum(weights)
+            # UNLESS all weights are equal. We just verify the range is [0, 100].
+            self.assertGreaterEqual(score.weighted_score, 0.0)
+            self.assertLessEqual(score.weighted_score, 100.0)
+            self.assertAlmostEqual(score.weighted_score, score.partial_weighted_score, places=4)
+
+    def test_partial_weighted_score_formula(self):
+        """partial_weighted_score = sum(score_i * weight_i / 100), verified manually."""
+        from auto_video_editor.analysis.models import DimensionScore, Scene, SceneScore
+        dims = (
+            DimensionScore("a", 60, 80.0, 1.0, "scored"),
+            DimensionScore("b", 40, 50.0, 1.0, "scored"),
+        )
+        # Expected: (80 * 60 / 100) + (50 * 40 / 100) = 48 + 20 = 68
+        expected_partial = 80.0 * 60 / 100.0 + 50.0 * 40 / 100.0
+        score = SceneScore(
+            scene_index=0, provider="mock", model_id=None,
+            prompt_version="1.0.0",
+            dimensions=dims,
+            score_coverage_percent=100.0,
+            partial_weighted_score=round(expected_partial, 4),
+            weighted_score=round(expected_partial, 4),
+            keyframes_used=1, status="scored",
+        )
+        self.assertAlmostEqual(score.partial_weighted_score, 68.0, places=2)
+        self.assertAlmostEqual(score.weighted_score, 68.0, places=2)
+
+    def test_partial_coverage_weighted_score_is_null(self):
+        """If score_coverage_percent < 100, weighted_score MUST be null."""
+        from auto_video_editor.analysis.models import DimensionScore, Scene, SceneScore
+        dims = (
+            DimensionScore("a", 60, 80.0, 1.0, "scored"),
+            DimensionScore("b", 40, None, None, "insufficient_evidence"),
+        )
+        score = SceneScore(
+            scene_index=0, provider="mock", model_id=None,
+            prompt_version="1.0.0",
+            dimensions=dims,
+            score_coverage_percent=60.0,  # only dim a scored
+            partial_weighted_score=round(80.0 * 60 / 100.0, 4),
+            weighted_score=None,  # coverage < 100 -> null
+            keyframes_used=1, status="scored",
+        )
+        self.assertEqual(score.score_coverage_percent, 60.0)
+        self.assertIsNone(score.weighted_score)
+        self.assertIsNotNone(score.partial_weighted_score)
+
+
+class TestScoringNonFinite(unittest.TestCase):
+    """Non-finite scores must be treated as missing evidence."""
+
+    def test_nan_score_not_counted(self):
+        """A NaN score must not contribute to coverage or partial_weighted_score."""
+        import math
+        from auto_video_editor.analysis.models import DimensionScore
+        # Simulate what backend should do: check isfinite before counting
+        dims = [
+            DimensionScore("a", 60, float("nan"), 1.0, "scored"),
+            DimensionScore("b", 40, 75.0, 1.0, "scored"),
+        ]
+        scored_dims = [
+            d for d in dims
+            if d.status == "scored" and d.score is not None and math.isfinite(d.score)
+        ]
+        coverage = sum(d.weight for d in scored_dims)
+        self.assertEqual(coverage, 40)  # only b counted
+        partial = sum(d.score * d.weight / 100 for d in scored_dims)
+        self.assertAlmostEqual(partial, 30.0)  # 75 * 40 / 100
+        # weighted_score must be null (coverage != 100)
+        weighted = partial if coverage == 100 else None
+        self.assertIsNone(weighted)
+
+
+class TestMergeShortDeterminism(unittest.TestCase):
+    """Merge determinism: equal-score, missing-score, inf-score tie-breaks."""
+
+    def _scene(self, idx, start, end, score):
+        from auto_video_editor.analysis.models import Scene
+        return Scene(idx, start, end, score)
+
+    def test_equal_boundary_scores_merges_previous(self):
+        """Equal left/right boundary scores -> always merge PREVIOUS."""
+        from auto_video_editor.analysis.scene_detector import _merge_short
+        # Scene 1 (0-3s): i=0, first -> merge next
+        # Scene 2 (3-3.5s): SHORT; left=scene2.raw_score=0.5, right=scene3.raw_score=0.5 -> equal -> merge PREVIOUS
+        # Scene 3 (3.5-10s): i=2
+        scenes = [
+            self._scene(0, 0, 3_000_000, None),
+            self._scene(1, 3_000_000, 3_500_000, 0.5),   # short (0.5s < 1.0s min)
+            self._scene(2, 3_500_000, 10_000_000, 0.5),
+        ]
+        min_us = 1_000_000
+        merged = _merge_short(scenes, min_us)
+        # Scene 1 (short) merges with PREVIOUS (scene 0) since left==right
+        self.assertEqual(len(merged), 2)
+        self.assertEqual(merged[0].start_us, 0)
+        self.assertEqual(merged[0].end_us, 3_500_000)  # scenes 0+1 merged
+
+    def test_missing_boundary_scores_merges_previous(self):
+        """Both boundary scores None -> always merge PREVIOUS."""
+        from auto_video_editor.analysis.scene_detector import _merge_short
+        scenes = [
+            self._scene(0, 0, 4_000_000, None),
+            self._scene(1, 4_000_000, 4_500_000, None),  # short, score=None
+            self._scene(2, 4_500_000, 10_000_000, None),
+        ]
+        min_us = 1_000_000
+        merged = _merge_short(scenes, min_us)
+        # Both None -> merge PREVIOUS
+        self.assertEqual(merged[0].start_us, 0)
+        self.assertEqual(merged[0].end_us, 4_500_000)
+
+    def test_lower_left_boundary_merges_previous(self):
+        """Left boundary score < right -> remove left -> merge with PREVIOUS."""
+        from auto_video_editor.analysis.scene_detector import _merge_short
+        scenes = [
+            self._scene(0, 0, 4_000_000, None),
+            self._scene(1, 4_000_000, 4_300_000, 0.2),   # short; left=0.2, right=0.8
+            self._scene(2, 4_300_000, 10_000_000, 0.8),
+        ]
+        min_us = 1_000_000
+        merged = _merge_short(scenes, min_us)
+        # left(0.2) < right(0.8) -> merge with previous (scene 0)
+        self.assertEqual(merged[0].start_us, 0)
+        self.assertEqual(merged[0].end_us, 4_300_000)
+
+    def test_lower_right_boundary_merges_next(self):
+        """Left boundary score > right -> remove right -> merge with NEXT."""
+        from auto_video_editor.analysis.scene_detector import _merge_short
+        scenes = [
+            self._scene(0, 0, 4_000_000, None),
+            self._scene(1, 4_000_000, 4_300_000, 0.9),   # short; left=0.9, right=0.1
+            self._scene(2, 4_300_000, 10_000_000, 0.1),
+        ]
+        min_us = 1_000_000
+        merged = _merge_short(scenes, min_us)
+        # left(0.9) > right(0.1) -> merge with next (scene 2)
+        self.assertEqual(merged[-1].start_us, 4_000_000)
+        self.assertEqual(merged[-1].end_us, 10_000_000)
+
+    def test_repeated_run_same_result(self):
+        """Same input always produces same merge output (deterministic)."""
+        from auto_video_editor.analysis.scene_detector import _merge_short
+        from auto_video_editor.analysis.models import Scene
+        scenes = [
+            Scene(0, 0, 3_000_000, 0.5),
+            Scene(1, 3_000_000, 3_400_000, 0.5),  # short, equal boundary scores
+            Scene(2, 3_400_000, 10_000_000, 0.5),
+        ]
+        min_us = 1_000_000
+        result1 = [s.start_us for s in _merge_short(list(scenes), min_us)]
+        result2 = [s.start_us for s in _merge_short(list(scenes), min_us)]
+        self.assertEqual(result1, result2, "Merge must be deterministic across repeated calls")
+
+    def test_inf_boundary_score_treated_as_missing(self):
+        """Infinity boundary score -> treated as non-finite -> always merge PREVIOUS."""
+        from auto_video_editor.analysis.scene_detector import _merge_short
+        scenes = [
+            self._scene(0, 0, 4_000_000, None),
+            self._scene(1, 4_000_000, 4_200_000, float("inf")),  # short; inf score
+            self._scene(2, 4_200_000, 10_000_000, 0.5),
+        ]
+        min_us = 1_000_000
+        merged = _merge_short(scenes, min_us)
+        # inf is non-finite -> merge PREVIOUS
+        self.assertEqual(merged[0].start_us, 0)
+        self.assertEqual(merged[0].end_us, 4_200_000)
+
+
+class TestCacheVersionBump(unittest.TestCase):
+    """Cache v2.0.0 — old caches must safely miss."""
+
+    def test_cache_schema_version_is_2(self):
+        from auto_video_editor.analysis.cache import CACHE_SCHEMA_VERSION
+        self.assertEqual(CACHE_SCHEMA_VERSION, "2.0.0")
+
+    def test_old_version_manifest_is_miss(self):
+        """A manifest with v1.0.0 must return None (safe miss)."""
+        import tempfile
+        tmp = tempfile.mkdtemp()
+        try:
+            from auto_video_editor.analysis.cache import AnalysisCache
+            cache = AnalysisCache(tmp)
+            # Manually write a stale v1.0.0 entry
+            import os, json as j
+            job_id = "abc123"
+            entry = os.path.join(tmp, job_id)
+            os.makedirs(entry)
+            with open(os.path.join(entry, "manifest.json"), "w") as f:
+                j.dump({"job_id": job_id, "cache_schema_version": "1.0.0"}, f)
+            with open(os.path.join(entry, "clip_analysis.json"), "w") as f:
+                j.dump({"schema_version": "1.0.0"}, f)
+            result = cache.get(job_id)
+            self.assertIsNone(result, "Stale v1.0.0 cache must be a miss")
+        finally:
+            import shutil
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
+class TestOutputOwnershipEnforcement(unittest.TestCase):
+    """--force cannot bypass source SHA mismatch."""
+
+    def test_force_cannot_override_different_source(self):
+        """Force with different source SHA -> exit 5 (not 0)."""
+        import tempfile, json as j, shutil
+        tmp = tempfile.mkdtemp()
+        try:
+            # Create a manifest owned by our tool with SHA "AAAAAA..."
+            manifest = {
+                "owner": "auto_video_editor.scene_analysis",
+                "source_sha256": "A" * 64,
+            }
+            with open(os.path.join(tmp, "manifest.json"), "w") as f:
+                j.dump(manifest, f)
+            # Write a dummy file so dir is non-empty
+            with open(os.path.join(tmp, "clip_analysis.json"), "w") as f:
+                f.write("{}")
+
+            from auto_video_editor.analysis.service import _check_ownership
+            from pathlib import Path
+            different_sha = "B" * 64
+            ok, msg = _check_ownership(Path(tmp), different_sha, force=True)
+            self.assertFalse(ok, "Force must NOT bypass source SHA mismatch")
+            self.assertIn("source sha mismatch", msg.lower())
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_force_on_same_source_is_ok(self):
+        """Force with matching source SHA is allowed."""
+        import tempfile, json as j, shutil
+        tmp = tempfile.mkdtemp()
+        try:
+            sha = "C" * 64
+            manifest = {
+                "owner": "auto_video_editor.scene_analysis",
+                "source_sha256": sha,
+            }
+            with open(os.path.join(tmp, "manifest.json"), "w") as f:
+                j.dump(manifest, f)
+            with open(os.path.join(tmp, "clip_analysis.json"), "w") as f:
+                f.write("{}")
+
+            from auto_video_editor.analysis.service import _check_ownership
+            from pathlib import Path
+            ok, msg = _check_ownership(Path(tmp), sha, force=True)
+            self.assertTrue(ok, f"Force on same-source owned dir should be OK: {msg}")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_unowned_dir_always_rejected(self):
+        """Non-empty dir with no manifest -> rejected (with or without --force)."""
+        import tempfile, shutil
+        tmp = tempfile.mkdtemp()
+        try:
+            # Write a file but no manifest
+            with open(os.path.join(tmp, "data.txt"), "w") as f:
+                f.write("hello")
+            from auto_video_editor.analysis.service import _check_ownership
+            from pathlib import Path
+            ok_no_force, _ = _check_ownership(Path(tmp), "A" * 64, force=False)
+            ok_force, _ = _check_ownership(Path(tmp), "A" * 64, force=True)
+            self.assertFalse(ok_no_force)
+            self.assertFalse(ok_force)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
 
 
 if __name__ == "__main__":

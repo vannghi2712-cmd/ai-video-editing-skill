@@ -51,6 +51,8 @@ class MockVisionBackend:
                 model_id=None,
                 prompt_version=PROMPT_VERSION,
                 dimensions=dims,
+                score_coverage_percent=0.0,
+                partial_weighted_score=None,
                 weighted_score=None,
                 keyframes_used=0,
                 status="insufficient_evidence",
@@ -62,8 +64,6 @@ class MockVisionBackend:
 
         confidence = _CONFIDENCE_FULL if n_ok == n_total else _CONFIDENCE_PARTIAL
         dims = []
-        weighted_sum = 0.0
-        weight_total = 0
 
         for idx, (dim, weight) in enumerate(profile.scoring.items()):
             # Use different byte offsets per dimension for independence
@@ -71,11 +71,16 @@ class MockVisionBackend:
             raw = int.from_bytes(seed_bytes[byte_idx: byte_idx + 4], "big")
             score = float(raw % 101)  # [0, 100]
             dims.append(DimensionScore(dim, weight, score, confidence, "scored"))
-            weighted_sum += weight * score
-            weight_total += weight
 
-        weight_total = weight_total or 1
-        weighted_score = round(weighted_sum / weight_total, 2)
+        # Correct scoring contract (no renormalization):
+        # score_coverage_percent = sum of weights of scored dims
+        # partial_weighted_score = sum(score * weight / 100) for scored dims
+        # weighted_score = partial_weighted_score ONLY if coverage == 100, else null
+        import math as _math  # noqa: PLC0415
+        scored_dims = [d for d in dims if d.status == "scored" and d.score is not None and _math.isfinite(d.score)]
+        score_coverage_percent = float(sum(d.weight for d in scored_dims))
+        partial_ws = round(sum(d.score * d.weight / 100.0 for d in scored_dims), 4)
+        weighted_score = partial_ws if score_coverage_percent == 100.0 else None
 
         return SceneScore(
             scene_index=scene.index,
@@ -83,6 +88,8 @@ class MockVisionBackend:
             model_id=None,
             prompt_version=PROMPT_VERSION,
             dimensions=tuple(dims),
+            score_coverage_percent=score_coverage_percent,
+            partial_weighted_score=partial_ws,
             weighted_score=weighted_score,
             keyframes_used=n_ok,
             status="scored",

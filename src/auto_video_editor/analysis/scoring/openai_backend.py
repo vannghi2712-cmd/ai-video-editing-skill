@@ -231,34 +231,41 @@ def _build_scene_score(
     ok_kf: list[Keyframe],
     profile: ContentProfile,
 ) -> SceneScore:
+    import math as _math  # noqa: PLC0415
     api_dims = {d["dimension"]: d for d in parsed.get("dimensions", [])}
     dims = []
-    weighted_sum = 0.0
-    weight_total = 0
-    any_scored = False
 
     for dim, weight in profile.scoring.items():
         api_d = api_dims.get(dim)
         if api_d and api_d.get("status") == "scored":
-            score = float(api_d["score"])
-            conf = float(api_d["confidence"])
+            raw_score = api_d["score"]
+            score = float(raw_score) if raw_score is not None else None
+            conf = float(api_d["confidence"]) if api_d.get("confidence") is not None else None
             dims.append(DimensionScore(dim, weight, score, conf, "scored"))
-            weighted_sum += weight * score
-            weight_total += weight
-            any_scored = True
         else:
             dims.append(DimensionScore(dim, weight, None, None, "insufficient_evidence"))
 
-    ws = round(weighted_sum / weight_total, 2) if weight_total else None
+    # Correct scoring contract: no renormalization
+    scored_dims = [
+        d for d in dims
+        if d.status == "scored" and d.score is not None and _math.isfinite(d.score)
+        and 0.0 <= d.score <= 100.0
+    ]
+    score_coverage_percent = float(sum(d.weight for d in scored_dims))
+    partial_ws = round(sum(d.score * d.weight / 100.0 for d in scored_dims), 4) if scored_dims else None
+    weighted_score = partial_ws if score_coverage_percent == 100.0 else None
+
     return SceneScore(
         scene_index=scene.index,
         provider="openai",
         model_id=model,
         prompt_version=PROMPT_VERSION,
         dimensions=tuple(dims),
-        weighted_score=ws,
+        score_coverage_percent=score_coverage_percent,
+        partial_weighted_score=partial_ws,
+        weighted_score=weighted_score,
         keyframes_used=len(ok_kf),
-        status="scored" if any_scored else "insufficient_evidence",
+        status="scored" if scored_dims else "insufficient_evidence",
     )
 
 
@@ -269,6 +276,8 @@ def _make_insufficient(scene: Scene, model: str, kf_used: int) -> SceneScore:
         model_id=model,
         prompt_version=PROMPT_VERSION,
         dimensions=(),
+        score_coverage_percent=0.0,
+        partial_weighted_score=None,
         weighted_score=None,
         keyframes_used=kf_used,
         status="insufficient_evidence",

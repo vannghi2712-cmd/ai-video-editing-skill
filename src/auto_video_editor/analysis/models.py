@@ -111,7 +111,12 @@ class SceneScore:
     model_id: str | None             # model identifier or None for mock
     prompt_version: str
     dimensions: tuple[DimensionScore, ...]
-    weighted_score: float | None     # host-computed weighted average, None if no dims scored
+    # score_coverage_percent: sum of weights of SCORED dimensions (0–100)
+    score_coverage_percent: float
+    # partial_weighted_score: sum(score * weight / 100) for scored dims only [0–100]
+    partial_weighted_score: float | None
+    # weighted_score: = partial_weighted_score ONLY when score_coverage_percent == 100, else null
+    weighted_score: float | None
     keyframes_used: int              # number of keyframes that contributed
     status: str                      # "scored" | "insufficient_evidence" | "failed"
 

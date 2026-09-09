@@ -1,4 +1,4 @@
-# Progress Log
+﻿# Progress Log
 
 > Tracks completed phases and implementation status for the automated short-form video editing pipeline.
 
@@ -283,3 +283,15 @@ Reconciliation: 264 − 6 (TestImmutableModelIdentity) + 7 (TestPinnedModelRevis
 ### Phase 4 Status
 
 Phase 4 remains NOT implemented. Explicit authorization required.
+
+## Phase 4 Contract Correction (2026-09-09)
+
+- Corrected scoring semantics: added `score_coverage_percent`, `partial_weighted_score`; `weighted_score` is null unless coverage == 100%
+- Silent renormalization eliminated
+- Cache identity bumped to v2.0.0 with full two-level identity (ordered keyframe SHAs, transcript context mode/hash, upload mode, request payload hash)
+- Output ownership enforced under `--force`; source SHA mismatch always rejects
+- `jsonschema` reclassified as MANDATORY_RUNTIME in pyproject.toml
+- OpenAI verification classified: STATICALLY_VERIFIED (docs), MOCK_VERIFIED (tests), NOT_RUN (live)
+- Scene merge now deterministic: boundary-score comparison, equal/missing -> always merge PREVIOUS
+- New docs: VISION_ANALYSIS_GUIDE.md, DEPENDENCY_AUDIT_PHASE4.md
+- Phase 5 remains LOCKED. Website remains NOT IMPLEMENTED.

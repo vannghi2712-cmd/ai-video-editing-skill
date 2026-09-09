@@ -175,7 +175,27 @@ def _build_scenes(boundaries: list[int], score_map: dict[int, float]) -> list[Sc
 
 
 def _merge_short(scenes: list[Scene], min_us: int) -> list[Scene]:
-    """Iteratively merge scenes shorter than min_us with lower-scored neighbor."""
+    """Iteratively merge scenes shorter than min_us.
+
+    Boundary-score deterministic algorithm:
+    - Boundary between i-1 and i has score = scenes[i].raw_score  (left boundary)
+    - Boundary between i and i+1 has score = scenes[i+1].raw_score (right boundary)
+    - Remove the lower-scored boundary (weaker scene cut):
+      left < right  -> remove left  -> merge with PREVIOUS (i-1)
+      left > right  -> remove right -> merge with NEXT (i+1)
+      equal / both missing / non-finite -> ALWAYS merge PREVIOUS (fully deterministic)
+    - First scene (i==0) -> always merge with NEXT (no previous exists)
+    - Last scene (i==last) -> always merge with PREVIOUS (no next exists)
+    """
+    import math as _math  # noqa: PLC0415
+
+    def _finite_score(s: Scene) -> float | None:
+        """Return raw_score if finite, else None."""
+        r = s.raw_score
+        if r is not None and _math.isfinite(r):
+            return r
+        return None
+
     if not scenes:
         return scenes
     changed = True
@@ -183,22 +203,27 @@ def _merge_short(scenes: list[Scene], min_us: int) -> list[Scene]:
         changed = False
         for i, s in enumerate(scenes):
             if s.duration_us < min_us:
-                # Prefer merging with the neighbor that has the lower raw_score
-                # (keep the more distinct scene, drop the less distinct boundary)
                 if i == 0:
-                    # Merge with next
                     merged = _merge_pair(scenes[0], scenes[1])
                     scenes = [merged] + scenes[2:]
                 elif i == len(scenes) - 1:
-                    # Merge with prev
                     merged = _merge_pair(scenes[-2], scenes[-1])
                     scenes = scenes[:-2] + [merged]
                 else:
-                    prev_score = scenes[i - 1].raw_score or 0.0
-                    next_score = scenes[i + 1].raw_score or 0.0
-                    if prev_score <= next_score:
+                    # Left boundary score: score of the cut that starts scene i
+                    left_score = _finite_score(scenes[i])
+                    # Right boundary score: score of the cut that starts scene i+1
+                    right_score = _finite_score(scenes[i + 1])
+
+                    if left_score is not None and right_score is not None:
+                        merge_prev = left_score <= right_score  # equal -> merge prev
+                    else:
+                        # Any missing/non-finite -> always merge PREVIOUS
+                        merge_prev = True
+
+                    if merge_prev:
                         merged = _merge_pair(scenes[i - 1], scenes[i])
-                        scenes = scenes[: i - 1] + [merged] + scenes[i + 1:]
+                        scenes = scenes[:i - 1] + [merged] + scenes[i + 1:]
                     else:
                         merged = _merge_pair(scenes[i], scenes[i + 1])
                         scenes = scenes[:i] + [merged] + scenes[i + 2:]

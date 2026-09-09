@@ -421,3 +421,10 @@ transcribe run
 Phase 4 (Vision API, scene scoring, edit planning, FFmpeg rendering, CapCut, video-use,
 Cloudflare deployment) is **NOT implemented**.
 Explicit user authorization is required before Phase 4 begins.
+
+## Phase 4 (Scene Analysis) — Contract Notes
+
+- Cache v2.0.0: two-level identity. Level A = source + tools + detector. Level B = Level A + keyframe SHAs + profile + provider + model + schema + transcript context + upload consent.
+- Scoring: `weighted_score` requires 100% coverage. Partial results use `partial_weighted_score` + `score_coverage_percent`.
+- Output ownership: `--force` cannot override source SHA mismatch.
+- Phase 5: LOCKED. Website: NOT IMPLEMENTED.

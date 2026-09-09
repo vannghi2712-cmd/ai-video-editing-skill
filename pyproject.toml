@@ -10,7 +10,10 @@ readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
 authors = [{ name = "Van Nghi Nguyen", email = "vannghi2712@gmail.com" }]
-dependencies = []
+dependencies = [
+    # Runtime schema validation for clip_analysis.json (MANDATORY_RUNTIME, lazy-imported)
+    "jsonschema==4.26.0",
+]
 
 # Optional transcription dependencies — install in .venv-whisperx ONLY.
 # NOT part of the mandatory base runtime. See requirements/transcription-windows-cpu.lock.txt.
