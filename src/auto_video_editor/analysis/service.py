@@ -3,30 +3,43 @@
 No hard-coded profile-ID branches.
 No shell=True. No GPU/CUDA.
 Ownership: --force cannot override source SHA mismatch.
-Cache order: provider cache looked up ONLY after keyframe bytes are verified.
+
+Cache order (ENFORCED):
+  1. Inspect source  2. Source SHA  3. Scene boundaries
+  4. Preprocessing identity  5. Extract keyframes
+  6. VERIFY KEYFRAME BYTES & RECALCULATE SHA-256
+  7. Build per-scene SemanticRequests + ContentBundles (verifies all bytes)
+  8. Aggregate canonical identity  9. Semantic job SHA
+  10. Provider cache lookup (ONLY after steps 6-9 complete)
 """
 from __future__ import annotations
 
 import hashlib
 import json
+import os
+import tempfile
 import time
 import uuid
 from pathlib import Path
 
 from auto_video_editor.analysis.cache import (
-    ADAPTER_VERSION,
     CACHE_SCHEMA_VERSION,
+    VISION_ADAPTER_VERSION,
     AnalysisCache,
     preprocessing_job_id,
-    provider_job_id,
+    semantic_request_job_id,
 )
 from auto_video_editor.analysis.config import AnalysisConfig
 from auto_video_editor.analysis.exporters import export_clip_analysis, validate_against_schema
 from auto_video_editor.analysis.keyframe_extractor import extract_keyframes
 from auto_video_editor.analysis.media_inspector import inspect_media
-from auto_video_editor.analysis.models import ClipAnalysis
+from auto_video_editor.analysis.models import (
+    ClipAnalysis,
+    ProviderContentBundle,
+    SceneVisionSemanticRequest,
+)
 from auto_video_editor.analysis.scene_detector import detect_scenes
-from auto_video_editor.analysis.scoring.base import PROMPT_VERSION
+from auto_video_editor.analysis.scoring.base import PROMPT_VERSION, VISION_ADAPTER_VERSION as _ADAPTER_VER
 from auto_video_editor.analysis.transcript_associator import (
     associate_transcript,
     load_transcript,
@@ -41,18 +54,19 @@ _OWNER_TAG = "auto_video_editor.scene_analysis"
 _MANIFEST_VERSION = "1.0.0"
 _ROOT_MARKER_FILENAME = ".scene_analysis_root"
 
-# FFmpeg/FFprobe version: detected at runtime.
 _TOOL_VERSION_UNKNOWN = "unknown"
+
+# SHA-256 of the prompt template string used by all providers.
+# Recompute if the prompt template content changes.
+_PROMPT_TEMPLATE_SHA = hashlib.sha256(
+    b"You are a professional video quality evaluator for short-form social media."
+).hexdigest()
 
 
 def _get_tool_version(tool: str) -> str:
-    """Get FFmpeg/FFprobe version string without shell=True."""
     import subprocess  # noqa: PLC0415
     try:
-        r = subprocess.run(
-            [tool, "-version"],
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-        )
+        r = subprocess.run([tool, "-version"], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         first_line = (r.stdout or r.stderr or b"").decode("utf-8", errors="replace").splitlines()
         return first_line[0].strip() if first_line else _TOOL_VERSION_UNKNOWN
     except Exception:  # noqa: BLE001
@@ -60,18 +74,14 @@ def _get_tool_version(tool: str) -> str:
 
 
 def _normalize_dir(p: Path) -> str:
-    """Return normalized absolute path string for root binding."""
     return str(p.resolve()).replace("\\", "/")
 
 
 def _root_binding_sha256(out_dir: Path) -> str:
-    """SHA-256 of normalized absolute output directory path."""
-    normalized = _normalize_dir(out_dir)
-    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+    return hashlib.sha256(_normalize_dir(out_dir).encode("utf-8")).hexdigest()
 
 
 def _read_root_marker(out_dir: Path) -> str | None:
-    """Read UUID from .scene_analysis_root marker file."""
     marker = out_dir / _ROOT_MARKER_FILENAME
     if not marker.exists() or not marker.is_file():
         return None
@@ -82,36 +92,57 @@ def _read_root_marker(out_dir: Path) -> str | None:
 
 
 def _write_root_marker(out_dir: Path, root_id: str) -> None:
-    """Write UUID to .scene_analysis_root marker file."""
     (out_dir / _ROOT_MARKER_FILENAME).write_text(root_id, encoding="utf-8")
 
 
+def _atomic_write(path: Path, data: bytes) -> None:
+    """Write data atomically: write to temp file then os.replace() (same directory)."""
+    parent = path.parent
+    fd, tmp_path = tempfile.mkstemp(dir=str(parent), prefix=".tmp_", suffix=path.suffix)
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+        os.replace(tmp_path, str(path))
+    except Exception:
+        try:
+            os.unlink(tmp_path)
+        except Exception:  # noqa: BLE001
+            pass
+        raise
+
+
+def _atomic_write_text(path: Path, text: str, encoding: str = "utf-8") -> None:
+    _atomic_write(path, text.encode(encoding))
+
+
+def _jpeg_dimensions(data: bytes) -> tuple[int, int]:
+    """Parse JPEG bytes to extract (width, height). Returns (0, 0) on failure."""
+    try:
+        i = 2  # skip SOI marker (FF D8)
+        while i < len(data) - 8:
+            if data[i] != 0xFF:
+                break
+            marker = data[i + 1]
+            if marker in (0xC0, 0xC1, 0xC2):  # SOF0/SOF1/SOF2
+                height = (data[i + 5] << 8) | data[i + 6]
+                width = (data[i + 7] << 8) | data[i + 8]
+                return width, height
+            segment_len = (data[i + 2] << 8) | data[i + 3]
+            i += 2 + segment_len
+    except Exception:  # noqa: BLE001
+        pass
+    return 0, 0
+
+
 def _check_ownership(out_dir: Path, source_sha256: str, force: bool) -> tuple[bool, str]:
-    """
-    Check output directory ownership.
-
-    Rules:
-    - Directory does not exist: OK
-    - Directory exists but is empty: OK
-    - Non-empty with valid manifest owned by _OWNER_TAG, matching source_sha256,
-      matching root_binding_sha256, and present marker file with matching output_root_id: OK
-    - --force cannot bypass source SHA mismatch or missing/mismatched marker.
-
-    Returns (ok: bool, error_message: str)
-    """
     if not out_dir.exists():
         return True, ""
-
-    # Reject symlinks and traversal attempts
     try:
-        resolved = out_dir.resolve()
-        # Must resolve to itself or a known subdirectory (no symlink escape)
-        if not resolved.is_dir():
+        if not out_dir.resolve().is_dir():
             return False, "Output dir is not a regular directory (symlink or missing)."
     except Exception:  # noqa: BLE001
         return False, "Output dir cannot be resolved."
 
-    # Empty dir is always OK
     children = [c for c in out_dir.iterdir() if c.name != _ROOT_MARKER_FILENAME]
     if not children:
         return True, ""
@@ -122,7 +153,6 @@ def _check_ownership(out_dir: Path, source_sha256: str, force: bool) -> tuple[bo
             "Output dir is non-empty but has no manifest.json. "
             "Use a different --output-dir or clear it manually."
         )
-
     try:
         existing = json.loads(manifest_path.read_text(encoding="utf-8"))
     except Exception:  # noqa: BLE001
@@ -135,7 +165,6 @@ def _check_ownership(out_dir: Path, source_sha256: str, force: bool) -> tuple[bo
             "Use a different --output-dir."
         )
 
-    # Verify root binding SHA
     expected_binding = _root_binding_sha256(out_dir)
     if existing.get("root_binding_sha256", "") != expected_binding:
         return False, (
@@ -143,7 +172,6 @@ def _check_ownership(out_dir: Path, source_sha256: str, force: bool) -> tuple[bo
             "Use a different --output-dir."
         )
 
-    # Verify marker file matches manifest
     marker_id = _read_root_marker(out_dir)
     manifest_root_id = existing.get("output_root_id", "")
     if not marker_id or not manifest_root_id or marker_id != manifest_root_id:
@@ -152,7 +180,6 @@ def _check_ownership(out_dir: Path, source_sha256: str, force: bool) -> tuple[bo
             "Use a different --output-dir."
         )
 
-    # Source SHA check — --force cannot bypass this
     existing_src = existing.get("source_sha256", "")
     if existing_src and existing_src != source_sha256:
         return False, (
@@ -160,29 +187,103 @@ def _check_ownership(out_dir: Path, source_sha256: str, force: bool) -> tuple[bo
             "--force cannot override a different-source directory. Use a different --output-dir."
         )
 
-    # Owned by us with matching source and binding: OK
     return True, ""
 
 
 def _verify_keyframe_bytes(keyframes) -> list:
-    """Recompute SHA-256 from bytes on disk for each ok keyframe.
-
-    Returns updated keyframe list. SHA mismatches are logged but do not
-    stop execution (the mismatch is reflected in the identity hash).
-    """
+    """Recompute SHA-256 from bytes on disk for each ok keyframe."""
     verified = []
     for kf in keyframes:
         if kf.status == "ok" and kf.path:
             disk_sha = AnalysisCache.verify_keyframe_sha256(kf.path)
             if disk_sha and disk_sha != kf.sha256:
-                # SHA changed — use disk value for identity (tamper indicator)
                 from auto_video_editor.analysis.models import Keyframe  # noqa: PLC0415
-                kf = Keyframe(
-                    kf.scene_index, kf.slot, kf.timestamp_us,
-                    kf.path, disk_sha, kf.status,
-                )
+                kf = Keyframe(kf.scene_index, kf.slot, kf.timestamp_us, kf.path, disk_sha, kf.status)
         verified.append(kf)
     return verified
+
+
+def _build_semantic_request(
+    scene,
+    ok_kf,
+    image_bytes_list: list[bytes],
+    profile,
+    profile_hash: str,
+    config: AnalysisConfig,
+    schema_sha: str,
+    ctx_text: str | None,
+) -> tuple[SceneVisionSemanticRequest, ProviderContentBundle]:
+    """Build one immutable SceneVisionSemanticRequest and its ProviderContentBundle."""
+
+    # Image descriptors — SHAs from actual bytes (already verified)
+    images = []
+    for order, (kf, b) in enumerate(zip(ok_kf, image_bytes_list)):
+        w, h = _jpeg_dimensions(b)
+        sha = hashlib.sha256(b).hexdigest()
+        images.append({
+            "order": order,
+            "frame_id": f"scene_{scene.index:04d}_slot_{kf.slot}",
+            "full_sha256": sha,
+            "mime_type": "image/jpeg",
+            "width": w,
+            "height": h,
+            "detail": "auto",
+        })
+
+    # Transcript context
+    if ctx_text is not None and config.include_transcript_context:
+        ctx_sha = AnalysisCache.transcript_context_sha256(ctx_text)
+        ctx_chars = len(ctx_text.encode("utf-8"))
+        ctx_mode = "included"
+    else:
+        ctx_sha = "not_included"
+        ctx_chars = 0
+        ctx_mode = "not_included"
+
+    # Ordered criteria from profile
+    ordered_criteria = [
+        {"order": i, "criterion_id": dim, "finite_weight": float(w)}
+        for i, (dim, w) in enumerate(profile.scoring.items())
+    ]
+
+    semantic_req = SceneVisionSemanticRequest(
+        provider_id=config.provider,
+        requested_model_id=config.vision_model or "",
+        adapter_version=_ADAPTER_VER,
+        prompt={"version": PROMPT_VERSION, "content_sha256": _PROMPT_TEMPLATE_SHA},
+        provider_options={
+            "detail": "auto",
+            "expected_slots": config.keyframe_slots,
+        },
+        scene={
+            "scene_id": scene.index,
+            "start_us": scene.start_us,
+            "end_us": scene.end_us,
+            "duration_us": scene.duration_us,
+        },
+        profile={
+            "profile_id": config.profile_id,
+            "resolved_profile_sha256": profile_hash,
+            "ordered_criteria": ordered_criteria,
+        },
+        images=tuple(images),
+        transcript_context={
+            "mode": ctx_mode,
+            "character_count": ctx_chars,
+            "content_sha256": ctx_sha,
+        },
+        response_schema={
+            "schema_version": _ANALYSIS_SCHEMA_VERSION,
+            "full_schema_sha256": schema_sha,
+        },
+    )
+
+    bundle = ProviderContentBundle(
+        image_bytes=list(image_bytes_list),
+        transcript_excerpt=ctx_text if ctx_mode == "included" else None,
+    )
+
+    return semantic_req, bundle
 
 
 class AnalysisService:
@@ -190,13 +291,6 @@ class AnalysisService:
 
     def run(self, config: AnalysisConfig) -> tuple[int, str]:
         """Execute the analysis pipeline.
-
-        Cache lookup order:
-          1. Inspect source → 2. Source SHA → 3. Scene boundaries →
-          4. Preprocessing cache identity → 5. Extract keyframes →
-          6. VERIFY KEYFRAME BYTES & RECALCULATE SHA-256 →
-          7. Associate transcript → 8. Build canonical request →
-          9. Build request payload SHA → 10. Provider cache lookup.
 
         Returns (exit_code, message).
           0=success, 3=profile, 4=media, 5=schema/output, 6=consent, 7=partial, 8=backend
@@ -212,7 +306,6 @@ class AnalysisService:
                 "Keyframes would be sent to OpenAI API."
             )
         if config.provider == "openai":
-            import os  # noqa: PLC0415
             if not os.environ.get("OPENAI_API_KEY"):
                 return 6, "OPENAI_API_KEY environment variable is not set."
 
@@ -225,37 +318,26 @@ class AnalysisService:
         profile_dict = profile.to_dict()
         profile_hash = AnalysisCache.profile_hash(profile_dict)
 
-        # ── Step 1: Inspect source (media) ────────────────────────────────────
+        # ── Step 1: Inspect source ────────────────────────────────────────────
         try:
             media_info, media_warnings = inspect_media(config.input_path)
         except Exception as exc:  # noqa: BLE001
             return 4, f"Media inspection failed: {exc}"
         warnings.extend(media_warnings)
 
-        # ── Dry-run: report estimates and stop ────────────────────────────────
+        # ── Dry-run ───────────────────────────────────────────────────────────
         if config.dry_run:
             est_scenes = max(1, int(media_info.duration_seconds / 5))
             est_kf = est_scenes * config.keyframe_slots
-            est_kf_bytes = est_kf * 150_000
-            est_api_calls = est_scenes if config.provider == "openai" else 0
-            transcript_chars = 0
-            if config.transcript_path:
-                try:
-                    td = load_transcript(config.transcript_path)
-                    transcript_chars = len(td.get("result", {}).get("full_text", ""))
-                except Exception:  # noqa: BLE001
-                    pass
             print(
                 f"DRY_RUN - Estimated: ~{est_scenes} scenes, "
-                f"~{est_kf} keyframes (~{est_kf_bytes//1024}KB), "
-                f"{est_api_calls} API calls, "
-                f"{transcript_chars} transcript chars"
+                f"~{est_kf} keyframes (~{est_kf * 150_000 // 1024}KB), "
+                f"{est_scenes if config.provider == 'openai' else 0} API calls"
             )
             return 0, "Dry-run complete"
 
         # ── Output directory ownership ────────────────────────────────────────
         out_dir.mkdir(parents=True, exist_ok=True)
-        # Write marker file on first use (empty or not yet owned)
         marker_id = _read_root_marker(out_dir)
         if marker_id is None:
             marker_id = str(uuid.uuid4())
@@ -274,14 +356,11 @@ class AnalysisService:
             except Exception as exc:  # noqa: BLE001
                 warnings.append(f"Transcript load failed: {exc}")
 
-        # ── Tool versions (for preprocessing identity) ───────────────────────
+        # ── Tool versions ─────────────────────────────────────────────────────
         ffmpeg_version = _get_tool_version("ffmpeg")
         ffprobe_version = _get_tool_version("ffprobe")
 
-        # ── Step 2: Source SHA ────────────────────────────────────────────────
-        # (already in media_info.sha256)
-
-        # ── Step 3: Scene boundaries ──────────────────────────────────────────
+        # ── Step 2-3: Source SHA + Scene boundaries ───────────────────────────
         try:
             scenes, scene_warnings = detect_scenes(
                 config.input_path, media_info.duration_us, config.detector
@@ -290,7 +369,7 @@ class AnalysisService:
             return 8, f"Scene detection failed: {exc}"
         warnings.extend(scene_warnings)
 
-        # ── Step 4: Preprocessing cache identity ──────────────────────────────
+        # ── Step 4: Preprocessing identity ───────────────────────────────────
         pre_id = preprocessing_job_id(
             source_sha256=media_info.sha256,
             ffmpeg_version=ffmpeg_version,
@@ -309,91 +388,73 @@ class AnalysisService:
             return 8, f"Keyframe extraction failed: {exc}"
         warnings.extend(kf_warnings)
 
-        # ── Step 6: VERIFY KEYFRAME BYTES & RECALCULATE SHA-256 ───────────────
+        # ── Step 6: VERIFY KEYFRAME BYTES & RECALCULATE SHA-256 ──────────────
         keyframes = _verify_keyframe_bytes(keyframes)
-        ordered_kf_shas = [kf.sha256 or "" for kf in keyframes]
 
-        # ── Step 7: Associate transcript ──────────────────────────────────────
+        # ── Associate transcript ──────────────────────────────────────────────
         transcript_associations = associate_transcript(
             scenes, transcript_dict or {}, config.include_transcript_context
         )
 
-        # ── Step 8: Build canonical semantic request ───────────────────────────
-        output_schema_sha = AnalysisCache.output_schema_sha256(_SCHEMA_PATH)
+        # ── Schema identity ───────────────────────────────────────────────────
+        schema_sha = AnalysisCache.output_schema_sha256(_SCHEMA_PATH)
 
-        # Determine transcript context mode and hash
-        if transcript_dict and config.include_transcript_context:
-            transcript_ctx_mode = "included"
-        elif transcript_dict:
-            transcript_ctx_mode = "redacted"
-        else:
-            transcript_ctx_mode = "not_included"
+        # ── Step 7: Build per-scene SemanticRequests + ContentBundles ─────────
+        # All keyframe bytes verified in step 6. Image bytes re-read here.
+        semantic_requests: list[SceneVisionSemanticRequest] = []
+        content_bundles: list[ProviderContentBundle] = []
 
-        # Hash the exact excerpt that will be sent (or "not-included")
-        # Build a representative context hash from all scenes' contexts
-        if transcript_ctx_mode == "included":
-            ctx_texts = [
-                assoc.full_text
-                for assoc in transcript_associations.values()
-                if assoc is not None
-            ]
-            combined_ctx = "\n".join(ctx_texts)
-            transcript_ctx_sha = AnalysisCache.transcript_context_sha256(combined_ctx or None)
-        else:
-            transcript_ctx_sha = "not-included"
+        for scene in scenes:
+            scene_kf = [kf for kf in keyframes if kf.scene_index == scene.index]
+            ok_kf = [kf for kf in scene_kf if kf.status == "ok" and kf.sha256]
 
-        # Canonical semantic request (immutable, drives both cache and provider)
-        canonical_request = {
-            "preprocessing_sha256": pre_id,
-            "ordered_keyframe_sha256s": ordered_kf_shas,
-            "resolved_profile_hash": profile_hash,
-            "provider_id": config.provider,
-            "requested_model_id": config.vision_model or "",
-            "adapter_version": ADAPTER_VERSION,
-            "prompt_version": PROMPT_VERSION,
-            "output_schema_version": _ANALYSIS_SCHEMA_VERSION,
-            "output_schema_sha256": output_schema_sha,
-            "transcript_context_mode": transcript_ctx_mode,
-            "transcript_context_sha256": transcript_ctx_sha,
-            "external_upload_mode": "allowed" if config.allow_external_upload else "denied",
-        }
+            # Read and verify image bytes for this scene
+            image_bytes_list: list[bytes] = []
+            verified_kf = []
+            for kf in ok_kf:
+                try:
+                    b = Path(kf.path).read_bytes()
+                    disk_sha = hashlib.sha256(b).hexdigest()
+                    if disk_sha != kf.sha256:
+                        warnings.append(
+                            f"Scene {scene.index}: keyframe SHA mismatch "
+                            f"(expected {kf.sha256[:8]}…, got {disk_sha[:8]}…)"
+                        )
+                    image_bytes_list.append(b)
+                    verified_kf.append(kf)
+                except Exception as exc:  # noqa: BLE001
+                    warnings.append(f"Scene {scene.index}: cannot read keyframe: {exc}")
 
-        # Sanitized debug projection (hashes, counts, IDs only — no raw content)
-        _debug_request = {
-            "preprocessing_sha256": pre_id[:12] + "...",
-            "keyframe_count": len([s for s in ordered_kf_shas if s]),
-            "profile_hash": profile_hash[:12] + "...",
-            "provider_id": config.provider,
-            "requested_model_id": config.vision_model or "",
-            "transcript_context_mode": transcript_ctx_mode,
-            "transcript_context_sha256": transcript_ctx_sha[:12] + "...",
-        }
+            ctx_obj = transcript_associations.get(scene.index)
+            ctx_text = (
+                ctx_obj.full_text
+                if ctx_obj and config.include_transcript_context
+                else None
+            )
 
-        # ── Step 9: Build request payload SHA ─────────────────────────────────
-        job_id = provider_job_id(
+            sem_req, bundle = _build_semantic_request(
+                scene, verified_kf, image_bytes_list,
+                profile, profile_hash, config, schema_sha, ctx_text,
+            )
+            semantic_requests.append(sem_req)
+            content_bundles.append(bundle)
+
+        # ── Step 8-9: Aggregate canonical identity → job SHA ──────────────────
+        scene_canonical_dicts = [req.to_canonical_identity_dict() for req in semantic_requests]
+        job_id = semantic_request_job_id(
             preprocessing_sha256=pre_id,
-            ordered_keyframe_sha256s=ordered_kf_shas,
-            resolved_profile_hash=profile_hash,
-            provider_id=config.provider,
-            requested_model_id=config.vision_model,
-            adapter_version=ADAPTER_VERSION,
-            prompt_version=PROMPT_VERSION,
-            output_schema_version=_ANALYSIS_SCHEMA_VERSION,
-            output_schema_sha256=output_schema_sha,
-            transcript_context_mode=transcript_ctx_mode,
-            transcript_context_sha256=transcript_ctx_sha,
-            external_upload_mode="allowed" if config.allow_external_upload else "denied",
+            scene_canonical_dicts=scene_canonical_dicts,
         )
 
-        # ── Step 10: Provider cache lookup (ONLY after verified keyframe SHAs) ─
+        # ── Step 10: Provider cache lookup (ONLY after verified semantic reqs) ─
         cache = AnalysisCache(config.cache_dir)
         if config.resume and not config.force:
             cached = cache.get(job_id)
             if cached:
                 print("Cache hit (OK) -- restoring from cache")
-                (out_dir / "clip_analysis.json").write_text(
+                _atomic_write_text(
+                    out_dir / "clip_analysis.json",
                     json.dumps(cached["analysis"], indent=2, ensure_ascii=False),
-                    encoding="utf-8",
                 )
                 return 0, "Analysis restored from cache"
 
@@ -401,16 +462,9 @@ class AnalysisService:
         backend = _build_backend(config)
         scores = []
         backend_errors = 0
-        for scene in scenes:
-            scene_kf = [kf for kf in keyframes if kf.scene_index == scene.index]
-            ctx_obj = transcript_associations.get(scene.index)
-            ctx_text = (
-                ctx_obj.full_text
-                if ctx_obj and config.include_transcript_context
-                else None
-            )
+        for scene, sem_req, bundle in zip(scenes, semantic_requests, content_bundles):
             try:
-                score = backend.score_scene(scene, scene_kf, profile, ctx_text)
+                score = backend.score_scene(sem_req, bundle)
                 scores.append(score)
             except Exception as exc:  # noqa: BLE001
                 warnings.append(f"Scene {scene.index} scoring failed: {exc}")
@@ -445,22 +499,21 @@ class AnalysisService:
                 "provider": config.provider,
                 "model_id": config.vision_model,
                 "prompt_version": PROMPT_VERSION,
-                "adapter_version": ADAPTER_VERSION,
+                "adapter_version": VISION_ADAPTER_VERSION,
             },
         )
 
-        # ── Export ────────────────────────────────────────────────────────────
+        # ── Export (atomic write) ─────────────────────────────────────────────
         analysis_json = export_clip_analysis(analysis)
 
-        # Schema validation (jsonschema is MANDATORY_RUNTIME)
         if _SCHEMA_PATH.exists():
             schema_errors = validate_against_schema(analysis_json, str(_SCHEMA_PATH))
             if schema_errors:
                 return 5, f"Schema validation failed: {'; '.join(schema_errors[:3])}"
 
-        (out_dir / "clip_analysis.json").write_text(analysis_json, encoding="utf-8")
+        _atomic_write_text(out_dir / "clip_analysis.json", analysis_json)
 
-        # ── Write output manifest ─────────────────────────────────────────────
+        # ── Write manifest (atomic) ───────────────────────────────────────────
         root_id = _read_root_marker(out_dir) or marker_id
         manifest = {
             "manifest_version": _MANIFEST_VERSION,
@@ -471,18 +524,16 @@ class AnalysisService:
             "profile_id": config.profile_id,
             "analysis_schema_version": _ANALYSIS_SCHEMA_VERSION,
             "cache_schema_version": CACHE_SCHEMA_VERSION,
-            "generated_artifacts": ["clip_analysis.json", "manifest.json", _ROOT_MARKER_FILENAME],
+            "generated_artifacts": [
+                "clip_analysis.json", "manifest.json", _ROOT_MARKER_FILENAME,
+            ],
         }
-        manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+        _atomic_write_text(manifest_path, json.dumps(manifest, indent=2))
 
         # ── Cache store ───────────────────────────────────────────────────────
         cache.put(
-            job_id,
-            analysis_json,
-            extra_manifest={
-                "source_sha256": media_info.sha256,
-                "provider_id": config.provider,
-            },
+            job_id, analysis_json,
+            extra_manifest={"source_sha256": media_info.sha256, "provider_id": config.provider},
         )
 
         n_scenes = len(scenes)
@@ -493,9 +544,8 @@ class AnalysisService:
             f"Scenes: {n_scenes}  Keyframes: {n_kf_ok}/{len(keyframes)}  "
             f"Scored: {n_scored}/{n_scenes}  Elapsed: {elapsed:.1f}s"
         )
-        if warnings:
-            for w in warnings:
-                print(f"  WARNING: {w}")
+        for w in warnings:
+            print(f"  WARNING: {w}")
 
         if overall_status == "partial":
             return 7, f"Partial - {backend_errors}/{n_scenes} scenes failed scoring"

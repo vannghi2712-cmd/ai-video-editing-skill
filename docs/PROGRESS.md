@@ -1,4 +1,4 @@
-﻿# Progress Log
+# Progress Log
 
 > Tracks completed phases and implementation status for the automated short-form video editing pipeline.
 
@@ -311,3 +311,29 @@ Phase 4 remains NOT implemented. Explicit authorization required.
 ### Tests
 - 361 tests PASS (base env), EXIT=0
 - 10 new closure regression tests added (TestClosureCorrections, TestOutputOwnershipEnforcement +2)
+
+---
+
+## Phase 4 Final Evidence and Contract Correction
+
+**Status:** ✅ COMPLETE
+**Commit:** `(current HEAD — pending push)`
+**Date:** 2026-09-10
+**Starting commit:** `fae77fb8fe341531e12b134cdf07febe3ede2386`
+**Commit message:** `fix: close phase 4 analysis contracts`
+
+### Changes
+- FIX 1 (Cache order): Provider cache lookup enforced AFTER all semantic requests built and keyframe bytes verified (step 10, after step 6)
+- FIX 2 (SceneVisionSemanticRequest): New immutable frozen dataclass — single source of truth for cache identity and provider construction; `to_canonical_identity_dict()` + `canonical_sha256()` methods; `ProviderContentBundle` for non-serializable bytes (never serialized or cached)
+- FIX 3 (Cache v4.0.0): `CACHE_SCHEMA_VERSION` bumped `3.0.0→4.0.0`; `ADAPTER_VERSION` renamed to `VISION_ADAPTER_VERSION = "1.3.0"`; `provider_job_id()` replaced by `semantic_request_job_id(preprocessing_sha256, scene_canonical_dicts)`
+- FIX 4 (VisionBackend API): `score_scene(semantic_request, content_bundle)` replaces `score_scene(scene, keyframes, profile, transcript_context)` — both backends updated; fixes pre-existing missing `score_coverage_percent`/`partial_weighted_score` in OpenAI no-keyframe path
+- FIX 5 (LegacyOutputSchemaError): `validate_against_schema()` now raises `LegacyOutputSchemaError(ValueError)` for v1.0.0 docs instead of returning an error list — explicit typed rejection
+- FIX 6 (Atomic writes): `_atomic_write_text()` / `_atomic_write()` using `tempfile.mkstemp` + `os.replace()` for `clip_analysis.json` and `manifest.json`
+- FIX 7 (JPEG dimensions): Standard-library `_jpeg_dimensions(bytes)` helper parses SOF0/SOF1/SOF2 markers for semantic request image descriptors
+- FIX 8 (Tests): 7 new semantic request + version contract tests; all old call sites updated to new `score_scene` API
+
+### Tests
+- **368 tests PASS, EXIT=0** (base env)
+- 7 new tests: `TestClosureCorrections` extended with semantic request + version + LegacyOutputSchemaError tests
+- Network-denied synthetic smoke test PASS: VERSION_CHECK, LEGACY_REJECTION, SEMANTIC_REQUEST_SHA, MOCK_BACKEND_NEW_API, ATOMIC_WRITE
+

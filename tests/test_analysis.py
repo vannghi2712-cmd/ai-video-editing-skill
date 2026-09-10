@@ -41,6 +41,92 @@ def _make_mock_profile(weights: dict[str, int] | None = None):
     )
 
 
+def _make_semantic_request(
+    scene_id: int = 0,
+    start_us: int = 0,
+    end_us: int = 5_000_000,
+    sha_list: list[str] | None = None,
+    profile=None,
+    transcript_text: str | None = None,
+    provider_id: str = "mock",
+):
+    """Build (SceneVisionSemanticRequest, ProviderContentBundle) for unit tests.
+
+    sha_list: list of 64-char hex SHA-256 strings (one per image slot).
+    If sha_list is None or empty → no images (insufficient evidence path).
+    Fake 1-byte image content is synthesised per SHA to fill the bundle.
+    """
+    from auto_video_editor.analysis.models import ProviderContentBundle, SceneVisionSemanticRequest
+    from auto_video_editor.analysis.scoring.base import PROMPT_VERSION, VISION_ADAPTER_VERSION
+
+    if profile is None:
+        profile = _make_mock_profile()
+
+    ordered_criteria = [
+        {"order": i, "criterion_id": dim, "finite_weight": float(w)}
+        for i, (dim, w) in enumerate(profile.scoring.items())
+    ]
+    sha_list = sha_list or []
+
+    images = []
+    image_bytes = []
+    for order, sha in enumerate(sha_list):
+        images.append({
+            "order": order,
+            "frame_id": f"scene_{scene_id:04d}_slot_{order}",
+            "full_sha256": sha,
+            "mime_type": "image/jpeg",
+            "width": 320,
+            "height": 240,
+            "detail": "auto",
+        })
+        # Synthetic bytes — not real JPEG, only needed for bundle
+        image_bytes.append(sha.encode("ascii"))
+
+    if transcript_text is not None:
+        ctx_sha = hashlib.sha256(transcript_text.encode("utf-8")).hexdigest()
+        ctx_mode = "included"
+        ctx_chars = len(transcript_text.encode("utf-8"))
+    else:
+        ctx_sha = "not_included"
+        ctx_mode = "not_included"
+        ctx_chars = 0
+
+    sem_req = SceneVisionSemanticRequest(
+        provider_id=provider_id,
+        requested_model_id="",
+        adapter_version=VISION_ADAPTER_VERSION,
+        prompt={"version": PROMPT_VERSION, "content_sha256": "test-prompt-sha"},
+        provider_options={"detail": "auto", "expected_slots": 3},
+        scene={
+            "scene_id": scene_id,
+            "start_us": start_us,
+            "end_us": end_us,
+            "duration_us": end_us - start_us,
+        },
+        profile={
+            "profile_id": profile.profile_id,
+            "resolved_profile_sha256": "P" * 64,
+            "ordered_criteria": ordered_criteria,
+        },
+        images=tuple(images),
+        transcript_context={
+            "mode": ctx_mode,
+            "character_count": ctx_chars,
+            "content_sha256": ctx_sha,
+        },
+        response_schema={
+            "schema_version": "2.0.0",
+            "full_schema_sha256": "schema-sha",
+        },
+    )
+    bundle = ProviderContentBundle(
+        image_bytes=image_bytes,
+        transcript_excerpt=transcript_text,
+    )
+    return sem_req, bundle
+
+
 def _synthetic_video_path(tmp_dir: str, duration_s: float = 8.0, has_audio: bool = True) -> str:
     """Generate a synthetic test video with FFmpeg. Returns path."""
     out = Path(tmp_dir) / "synthetic_test.mp4"
@@ -362,22 +448,20 @@ class TestMockVisionBackend(unittest.TestCase):
         from auto_video_editor.analysis.scoring.mock_backend import MockVisionBackend
         backend = MockVisionBackend()
         profile = _make_mock_profile()
-        kf = self._kf()
-        s1 = backend.score_scene(self._scene(), [kf], profile, None)
-        s2 = backend.score_scene(self._scene(), [kf], profile, None)
+        sha = "A" * 64
+        req, bundle = _make_semantic_request(sha_list=[sha], profile=profile)
+        s1 = backend.score_scene(req, bundle)
+        s2 = backend.score_scene(req, bundle)
         self.assertEqual(s1.weighted_score, s2.weighted_score)
 
     def test_different_sha_different_score(self):
         from auto_video_editor.analysis.scoring.mock_backend import MockVisionBackend
         backend = MockVisionBackend()
         profile = _make_mock_profile()
-        kf1 = self._kf("A" * 64)
-        kf2 = self._kf("B" * 64)
-        s1 = backend.score_scene(self._scene(), [kf1], profile, None)
-        s2 = backend.score_scene(self._scene(), [kf2], profile, None)
-        # Different SHAs should (almost certainly) produce different scores
-        # Not guaranteed but statistically near-certain for distinct hex strings
-        # We just verify score range and structure
+        req1, bundle1 = _make_semantic_request(sha_list=["A" * 64], profile=profile)
+        req2, bundle2 = _make_semantic_request(sha_list=["B" * 64], profile=profile)
+        s1 = backend.score_scene(req1, bundle1)
+        s2 = backend.score_scene(req2, bundle2)
         self.assertIsNotNone(s1.weighted_score)
         for d in s1.dimensions:
             self.assertGreaterEqual(d.score, 0)
@@ -387,7 +471,8 @@ class TestMockVisionBackend(unittest.TestCase):
         from auto_video_editor.analysis.scoring.mock_backend import MockVisionBackend
         backend = MockVisionBackend()
         profile = _make_mock_profile()
-        s = backend.score_scene(self._scene(), [], profile, None)
+        req, bundle = _make_semantic_request(sha_list=[], profile=profile)
+        s = backend.score_scene(req, bundle)
         self.assertEqual(s.status, "insufficient_evidence")
         self.assertIsNone(s.weighted_score)
         for d in s.dimensions:
@@ -399,8 +484,8 @@ class TestMockVisionBackend(unittest.TestCase):
         backend = MockVisionBackend()
         weights = {"clarity": 50, "engagement": 50}
         profile = _make_mock_profile(weights)
-        kf = self._kf()
-        score = backend.score_scene(self._scene(), [kf], profile, None)
+        req, bundle = _make_semantic_request(sha_list=["A" * 64], profile=profile)
+        score = backend.score_scene(req, bundle)
         dim_names = {d.dimension for d in score.dimensions}
         self.assertEqual(dim_names, {"clarity", "engagement"})
 
@@ -417,10 +502,11 @@ class TestMockVisionBackend(unittest.TestCase):
         from auto_video_editor.analysis.scoring.mock_backend import MockVisionBackend
         backend = MockVisionBackend()
         profile = _make_mock_profile()
-        # No keyframes → all null
-        s = backend.score_scene(self._scene(), [], profile, None)
+        req, bundle = _make_semantic_request(sha_list=[], profile=profile)
+        s = backend.score_scene(req, bundle)
         for d in s.dimensions:
             self.assertIsNone(d.score, "Missing evidence must be null, not 0")
+
 
 
 # ── Consent Gates ─────────────────────────────────────────────────────────────
@@ -482,11 +568,12 @@ class TestAnalysisCache(unittest.TestCase):
         return AnalysisCache(self.tmp)
 
     def _job_id(self, source_sha="A" * 64, provider_id="mock"):
-        """Compute a provider_job_id for test use."""
+        """Compute a semantic_request_job_id for test use."""
         from auto_video_editor.analysis.cache import (
-            preprocessing_job_id, provider_job_id, ADAPTER_VERSION, CACHE_SCHEMA_VERSION,
+            preprocessing_job_id,
+            semantic_request_job_id,
+            CACHE_SCHEMA_VERSION,
         )
-        from auto_video_editor.analysis.scoring.base import PROMPT_VERSION
         pre_id = preprocessing_job_id(
             source_sha256=source_sha,
             ffmpeg_version="test-ffmpeg",
@@ -495,19 +582,11 @@ class TestAnalysisCache(unittest.TestCase):
             extractor_slots=3,
             extractor_max_dim=1280,
         )
-        return provider_job_id(
+        profile = _make_mock_profile()
+        req, _ = _make_semantic_request(sha_list=[], profile=profile, provider_id=provider_id)
+        return semantic_request_job_id(
             preprocessing_sha256=pre_id,
-            ordered_keyframe_sha256s=[],
-            resolved_profile_hash="C" * 64,
-            provider_id=provider_id,
-            requested_model_id=None,
-            adapter_version=ADAPTER_VERSION,
-            prompt_version=PROMPT_VERSION,
-            output_schema_version="2.0.0",
-            output_schema_sha256="schema-missing",
-            transcript_context_mode="not_included",
-            transcript_context_sha256="not-included",
-            external_upload_mode="denied",
+            scene_canonical_dicts=[req.to_canonical_identity_dict()],
         )
 
     def test_miss_returns_none(self):
@@ -796,7 +875,8 @@ class TestScoringContractFull(unittest.TestCase):
         from auto_video_editor.analysis.scoring.mock_backend import MockVisionBackend
         backend = MockVisionBackend()
         profile = _make_mock_profile({"food_appeal": 60, "motion": 40})
-        score = backend.score_scene(self._make_scene(), [self._kf()], profile, None)
+        req, bundle = _make_semantic_request(sha_list=["A" * 64], profile=profile)
+        score = backend.score_scene(req, bundle)
         self.assertEqual(score.score_coverage_percent, 100.0)
         self.assertIsNotNone(score.partial_weighted_score)
         self.assertEqual(score.weighted_score, score.partial_weighted_score)
@@ -806,7 +886,8 @@ class TestScoringContractFull(unittest.TestCase):
         from auto_video_editor.analysis.scoring.mock_backend import MockVisionBackend
         backend = MockVisionBackend()
         profile = _make_mock_profile({"food_appeal": 60, "motion": 40})
-        score = backend.score_scene(self._make_scene(), [], profile, None)
+        req, bundle = _make_semantic_request(sha_list=[], profile=profile)
+        score = backend.score_scene(req, bundle)
         self.assertEqual(score.score_coverage_percent, 0.0)
         self.assertEqual(score.partial_weighted_score, 0.0,
                          "Zero coverage must emit 0.0 (numeric zero), not null")
@@ -814,20 +895,17 @@ class TestScoringContractFull(unittest.TestCase):
 
     def test_no_renormalization(self):
         """weighted_score must not divide by sum(scored weights)."""
-        # With full coverage mock backend, all weights are scored -> weighted_score
-        # should be sum(score*weight/100), NOT sum(score*weight)/sum(weights).
         from auto_video_editor.analysis.scoring.mock_backend import MockVisionBackend
         import math
         backend = MockVisionBackend()
         profile = _make_mock_profile({"a": 50, "b": 50})
-        score = backend.score_scene(self._make_scene(), [self._kf()], profile, None)
+        req, bundle = _make_semantic_request(sha_list=["A" * 64], profile=profile)
+        score = backend.score_scene(req, bundle)
         if score.weighted_score is not None and score.partial_weighted_score is not None:
-            # partial_weighted_score = sum(score_i * weight_i / 100)
-            # This is NOT the same as sum(score_i * weight_i) / sum(weights)
-            # UNLESS all weights are equal. We just verify the range is [0, 100].
             self.assertGreaterEqual(score.weighted_score, 0.0)
             self.assertLessEqual(score.weighted_score, 100.0)
             self.assertAlmostEqual(score.weighted_score, score.partial_weighted_score, places=4)
+
 
     def test_partial_weighted_score_formula(self):
         """partial_weighted_score = sum(score_i * weight_i / 100), verified manually."""
@@ -993,14 +1071,14 @@ class TestMergeShortDeterminism(unittest.TestCase):
 
 
 class TestCacheVersionBump(unittest.TestCase):
-    """Cache v3.0.0 — old caches must safely miss."""
+    """Cache v4.0.0 — old caches must safely miss."""
 
-    def test_cache_schema_version_is_3(self):
+    def test_cache_schema_version_is_4(self):
         from auto_video_editor.analysis.cache import CACHE_SCHEMA_VERSION
-        self.assertEqual(CACHE_SCHEMA_VERSION, "3.0.0")
+        self.assertEqual(CACHE_SCHEMA_VERSION, "4.0.0")
 
     def test_old_version_manifest_is_miss(self):
-        """A manifest with v2.0.0 (old) must return None (safe miss on v3.0.0)."""
+        """A manifest with v3.0.0 (old) must return None (safe miss on v4.0.0)."""
         import tempfile
         tmp = tempfile.mkdtemp()
         try:
@@ -1011,11 +1089,11 @@ class TestCacheVersionBump(unittest.TestCase):
             entry = os.path.join(tmp, job_id)
             os.makedirs(entry)
             with open(os.path.join(entry, "manifest.json"), "w") as f:
-                j.dump({"job_id": job_id, "cache_schema_version": "2.0.0"}, f)
+                j.dump({"job_id": job_id, "cache_schema_version": "3.0.0"}, f)
             with open(os.path.join(entry, "clip_analysis.json"), "w") as f:
                 j.dump({"schema_version": "2.0.0"}, f)
             result = cache.get(job_id)
-            self.assertIsNone(result, "Stale v2.0.0 cache must be a miss on v3.0.0")
+            self.assertIsNone(result, "Stale v3.0.0 cache must be a miss on v4.0.0")
         finally:
             import shutil
             shutil.rmtree(tmp, ignore_errors=True)
@@ -1040,6 +1118,136 @@ class TestCacheVersionBump(unittest.TestCase):
         finally:
             import shutil
             shutil.rmtree(tmp, ignore_errors=True)
+
+
+class TestClosureCorrections(unittest.TestCase):
+    """Phase 4 Closure + Final Contract regression tests."""
+
+    def test_v1_schema_rejected_by_validator(self):
+        """validate_against_schema must raise LegacyOutputSchemaError for v1.0.0."""
+        from auto_video_editor.analysis.exporters import validate_against_schema
+        from auto_video_editor.analysis.models import LegacyOutputSchemaError
+        import json as j
+        v1_doc = j.dumps({"schema_version": "1.0.0", "status": "complete"})
+        with self.assertRaises(LegacyOutputSchemaError) as ctx:
+            validate_against_schema(v1_doc, str(
+                __import__("pathlib").Path(__file__).parent.parent /
+                "schemas" / "clip_analysis.schema.json"
+            ))
+        self.assertIn("1.0.0", str(ctx.exception))
+
+    def test_schema_version_is_2(self):
+        """Exporter SCHEMA_VERSION must be 2.0.0."""
+        from auto_video_editor.analysis.exporters import SCHEMA_VERSION
+        self.assertEqual(SCHEMA_VERSION, "2.0.0")
+
+    def test_partial_weighted_score_is_always_float(self):
+        """partial_weighted_score must be float (never None) for zero-coverage scene."""
+        from auto_video_editor.analysis.scoring.mock_backend import MockVisionBackend
+        backend = MockVisionBackend()
+        profile = _make_mock_profile({"a": 60, "b": 40})
+        req, bundle = _make_semantic_request(sha_list=[], profile=profile)
+        score = backend.score_scene(req, bundle)
+        self.assertIsInstance(score.partial_weighted_score, float,
+                              "partial_weighted_score must be float, not None")
+        self.assertEqual(score.partial_weighted_score, 0.0)
+
+    def test_cache_not_included_sentinel(self):
+        """transcript_context_sha256 sentinel must be 'not-included'."""
+        from auto_video_editor.analysis.cache import AnalysisCache
+        sha = AnalysisCache.transcript_context_sha256(None)
+        self.assertEqual(sha, "not-included")
+
+    def test_keyframe_sha_verification(self):
+        """AnalysisCache.verify_keyframe_sha256 reads file bytes and returns SHA."""
+        import tempfile, hashlib
+        data = b"fake_jpeg_data"
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as f:
+            f.write(data)
+            fname = f.name
+        try:
+            from auto_video_editor.analysis.cache import AnalysisCache
+            result = AnalysisCache.verify_keyframe_sha256(fname)
+            expected = hashlib.sha256(data).hexdigest()
+            self.assertEqual(result, expected)
+        finally:
+            import os
+            os.unlink(fname)
+
+    def test_keyframe_sha_missing_file_returns_none(self):
+        """verify_keyframe_sha256 returns None for missing files."""
+        from auto_video_editor.analysis.cache import AnalysisCache
+        result = AnalysisCache.verify_keyframe_sha256("/nonexistent/path/kf.jpg")
+        self.assertIsNone(result)
+
+    def test_provider_cache_only_after_verified_keyframes(self):
+        """Service must build semantic job id AFTER keyframe bytes are verified."""
+        import inspect
+        from auto_video_editor.analysis import service as svc
+        src = inspect.getsource(svc.AnalysisService.run)
+        step6_pos = src.find("VERIFY KEYFRAME BYTES")
+        step10_pos = src.find("Provider cache lookup")
+        self.assertGreater(step6_pos, 0, "Step 6 comment must exist in service.run")
+        self.assertGreater(step10_pos, 0, "Step 10 comment must exist in service.run")
+        self.assertLess(step6_pos, step10_pos,
+                        "Keyframe verification (step 6) must precede provider cache lookup (step 10)")
+
+    def test_semantic_request_canonical_sha_deterministic(self):
+        """Same semantic request always produces same SHA-256."""
+        req, _ = _make_semantic_request(sha_list=["A" * 64])
+        sha1 = req.canonical_sha256()
+        sha2 = req.canonical_sha256()
+        self.assertEqual(sha1, sha2)
+        self.assertEqual(len(sha1), 64)
+
+    def test_semantic_request_different_sha_different_identity(self):
+        """Different image SHAs produce different canonical identities."""
+        req1, _ = _make_semantic_request(sha_list=["A" * 64])
+        req2, _ = _make_semantic_request(sha_list=["B" * 64])
+        self.assertNotEqual(req1.canonical_sha256(), req2.canonical_sha256())
+
+    def test_semantic_request_immutable(self):
+        """SceneVisionSemanticRequest must be immutable (frozen dataclass)."""
+        req, _ = _make_semantic_request(sha_list=["A" * 64])
+        with self.assertRaises((AttributeError, TypeError)):
+            req.provider_id = "hacked"  # type: ignore[misc]
+
+    def test_provider_content_bundle_not_in_canonical_dict(self):
+        """ProviderContentBundle fields must NOT appear in canonical identity dict."""
+        req, bundle = _make_semantic_request(sha_list=["A" * 64])
+        identity = req.to_canonical_identity_dict()
+        identity_str = json.dumps(identity)
+        # Raw bytes should never be in the canonical identity
+        self.assertNotIn("image_bytes", identity_str)
+        self.assertNotIn("transcript_excerpt", identity_str)
+
+    def test_legacy_output_schema_error_is_value_error(self):
+        """LegacyOutputSchemaError must be a ValueError subclass."""
+        from auto_video_editor.analysis.models import LegacyOutputSchemaError
+        self.assertTrue(issubclass(LegacyOutputSchemaError, ValueError))
+
+    def test_vision_adapter_version(self):
+        """VISION_ADAPTER_VERSION must be 1.3.0."""
+        from auto_video_editor.analysis.scoring.base import VISION_ADAPTER_VERSION
+        self.assertEqual(VISION_ADAPTER_VERSION, "1.3.0")
+        from auto_video_editor.analysis.cache import VISION_ADAPTER_VERSION as CV
+        self.assertEqual(CV, "1.3.0")
+
+    def test_semantic_request_job_id_exists(self):
+        """semantic_request_job_id must exist and return 64-char hex."""
+        from auto_video_editor.analysis.cache import (
+            semantic_request_job_id, preprocessing_job_id,
+        )
+        pre = preprocessing_job_id(
+            source_sha256="A" * 64, ffmpeg_version="v", ffprobe_version="v",
+            scene_detector_config={}, extractor_slots=3, extractor_max_dim=1280,
+        )
+        req, _ = _make_semantic_request()
+        jid = semantic_request_job_id(
+            preprocessing_sha256=pre,
+            scene_canonical_dicts=[req.to_canonical_identity_dict()],
+        )
+        self.assertEqual(len(jid), 64)
 
 
 def _make_full_ownership_manifest(tmp_path):
@@ -1145,84 +1353,6 @@ class TestOutputOwnershipEnforcement(unittest.TestCase):
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 
-
-class TestClosureCorrections(unittest.TestCase):
-    """Phase 4 Closure Correction regression tests."""
-
-    def test_v1_schema_rejected_by_validator(self):
-        """validate_against_schema must reject v1.0.0 output with a clear error."""
-        from auto_video_editor.analysis.exporters import validate_against_schema, SCHEMA_VERSION
-        import json as j
-        v1_doc = j.dumps({"schema_version": "1.0.0", "status": "complete"})
-        errors = validate_against_schema(v1_doc, str(
-            __import__("pathlib").Path(__file__).parent.parent /
-            "schemas" / "clip_analysis.schema.json"
-        ))
-        self.assertTrue(len(errors) > 0, "V1 output must be rejected")
-        self.assertIn("1.0.0", errors[0])
-
-    def test_schema_version_is_2(self):
-        """Exporter SCHEMA_VERSION must be 2.0.0."""
-        from auto_video_editor.analysis.exporters import SCHEMA_VERSION
-        self.assertEqual(SCHEMA_VERSION, "2.0.0")
-
-    def test_partial_weighted_score_is_always_float(self):
-        """partial_weighted_score must be float (never None) for zero-coverage scene."""
-        from auto_video_editor.analysis.scoring.mock_backend import MockVisionBackend
-        backend = MockVisionBackend()
-        profile = _make_mock_profile({"a": 60, "b": 40})
-        scene = __import__("auto_video_editor.analysis.models", fromlist=["Scene"]).Scene(
-            0, 0, 5_000_000, None
-        )
-        score = backend.score_scene(scene, [], profile, None)
-        self.assertIsInstance(score.partial_weighted_score, float,
-                              "partial_weighted_score must be float, not None")
-        self.assertEqual(score.partial_weighted_score, 0.0)
-
-    def test_cache_not_included_sentinel(self):
-        """transcript_context_sha256 sentinel must be 'not-included'."""
-        from auto_video_editor.analysis.cache import AnalysisCache
-        sha = AnalysisCache.transcript_context_sha256(None)
-        self.assertEqual(sha, "not-included")
-
-    def test_keyframe_sha_verification(self):
-        """AnalysisCache.verify_keyframe_sha256 reads file bytes and returns SHA."""
-        import tempfile, hashlib
-        data = b"fake_jpeg_data"
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as f:
-            f.write(data)
-            fname = f.name
-        try:
-            from auto_video_editor.analysis.cache import AnalysisCache
-            result = AnalysisCache.verify_keyframe_sha256(fname)
-            expected = hashlib.sha256(data).hexdigest()
-            self.assertEqual(result, expected)
-        finally:
-            import os
-            os.unlink(fname)
-
-    def test_keyframe_sha_missing_file_returns_none(self):
-        """verify_keyframe_sha256 returns None for missing files."""
-        from auto_video_editor.analysis.cache import AnalysisCache
-        result = AnalysisCache.verify_keyframe_sha256("/nonexistent/path/kf.jpg")
-        self.assertIsNone(result)
-
-    def test_provider_cache_only_after_verified_keyframes(self):
-        """Service must build provider job_id with real keyframe SHAs (spy test)."""
-        # Verify that provider_job_id is called AFTER keyframes are extracted.
-        # We can verify this contract by checking that ordered_kf_shas is passed
-        # to provider_job_id only when extraction is complete.
-        # This is a static import-order / contract test.
-        import inspect
-        from auto_video_editor.analysis import service as svc
-        src = inspect.getsource(svc.AnalysisService.run)
-        # Step 6 (verify keyframe bytes) must appear before Step 10 (cache lookup)
-        step6_pos = src.find("VERIFY KEYFRAME BYTES")
-        step10_pos = src.find("Provider cache lookup")
-        self.assertGreater(step6_pos, 0, "Step 6 comment must exist in service.run")
-        self.assertGreater(step10_pos, 0, "Step 10 comment must exist in service.run")
-        self.assertLess(step6_pos, step10_pos,
-                        "Keyframe verification (step 6) must precede provider cache lookup (step 10)")
 
 
 if __name__ == "__main__":

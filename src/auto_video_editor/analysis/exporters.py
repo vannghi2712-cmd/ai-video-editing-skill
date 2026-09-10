@@ -12,7 +12,11 @@ import math
 from pathlib import Path
 
 from auto_video_editor.analysis.models import (
-    ClipAnalysis, Keyframe, Scene, SceneScore,
+    ClipAnalysis,
+    Keyframe,
+    LegacyOutputSchemaError,
+    Scene,
+    SceneScore,
 )
 
 SCHEMA_VERSION = "2.0.0"
@@ -127,7 +131,7 @@ def validate_against_schema(analysis_json: str, schema_path: str) -> list[str]:
     """Validate JSON string against clip_analysis.schema.json.
 
     Returns list of error messages (empty = valid).
-    Explicitly rejects v1.0.0 output (V1 policy: writer emits 2.0.0 only).
+    Raises LegacyOutputSchemaError for v1.0.0 output (never silently accepts).
     Silently skips validation if jsonschema is not installed.
     """
     import json as _json  # noqa: PLC0415
@@ -136,13 +140,13 @@ def validate_against_schema(analysis_json: str, schema_path: str) -> list[str]:
     except _json.JSONDecodeError as exc:
         return [f"JSON parse error: {exc}"]
 
-    # V1 rejection: must not silently accept legacy schema versions
+    # V1 rejection: raise typed exception — no silent conversion
     doc_version = instance.get("schema_version", "")
     if doc_version in _REJECTED_SCHEMA_VERSIONS:
-        return [
-            f"Rejected: schema_version '{doc_version}' is a legacy version and is no longer accepted. "
-            f"Expected '{SCHEMA_VERSION}'."
-        ]
+        raise LegacyOutputSchemaError(
+            f"schema_version '{doc_version}' is a legacy version and is not accepted. "
+            f"Expected '{SCHEMA_VERSION}'. No silent conversion is performed."
+        )
 
     try:
         from jsonschema import Draft202012Validator  # noqa: PLC0415

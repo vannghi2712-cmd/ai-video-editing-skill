@@ -5,8 +5,21 @@ No hard-coded profile-ID branches anywhere in this module.
 """
 from __future__ import annotations
 
+import hashlib
+import json
 from dataclasses import dataclass, field
 from typing import Any
+
+
+# ── Exceptions ────────────────────────────────────────────────────────────────
+
+class LegacyOutputSchemaError(ValueError):
+    """Raised when a legacy (V1) clip_analysis schema version is encountered.
+
+    The writer always emits 2.0.0. The validator always rejects 1.0.0.
+    No silent conversion is performed.
+    """
+
 
 
 # ── Media ─────────────────────────────────────────────────────────────────────
@@ -139,3 +152,91 @@ class ClipAnalysis:
     warnings: tuple[str, ...]
     metrics: dict[str, Any]
     provenance: dict[str, Any]
+
+
+# ── Semantic Request Abstraction (Phase 4 Final Contract) ─────────────────────
+
+@dataclass(frozen=True)
+class SceneVisionSemanticRequest:
+    """Immutable, JSON-compatible canonical scoring request for ONE scene.
+
+    This object is the SINGLE source of truth for:
+    - Cache identity (via to_canonical_identity_dict() → SHA-256)
+    - Provider request construction (via ProviderContentBundle)
+
+    CONTENT BOUNDARY: No raw bytes, secrets, or absolute paths. All image
+    evidence is referenced by SHA-256. Raw bytes live in ProviderContentBundle.
+
+    Fields
+    ------
+    provider_id         : "mock" | "openai"
+    requested_model_id  : model name or "" for mock
+    adapter_version     : "1.3.0"
+    prompt              : {"version": str, "content_sha256": str}
+    provider_options    : non-secret options affecting the response
+    scene               : {"scene_id": int, "start_us": int, "end_us": int, "duration_us": int}
+    profile             : {"profile_id": str, "resolved_profile_sha256": str,
+                           "ordered_criteria": [{"order": int, "criterion_id": str, "finite_weight": float}]}
+    images              : ordered tuple of {"order": int, "frame_id": str, "full_sha256": str,
+                           "mime_type": str, "width": int, "height": int, "detail": str}
+    transcript_context  : {"mode": str, "character_count": int, "content_sha256": str}
+                          mode: "not_included" | "included" | "redacted"
+                          content_sha256: SHA-256 of exact UTF-8 excerpt or "not_included"
+    response_schema     : {"schema_version": str, "full_schema_sha256": str}
+    """
+    provider_id: str
+    requested_model_id: str
+    adapter_version: str
+    prompt: dict
+    provider_options: dict
+    scene: dict
+    profile: dict
+    images: tuple[dict, ...]
+    transcript_context: dict
+    response_schema: dict
+
+    def to_canonical_identity_dict(self) -> dict:
+        """Return a deterministic, JSON-serializable dict for cache hashing.
+
+        The returned dict contains only primitive types (str, int, float, bool,
+        None, list, dict). It is safe to pass to json.dumps(sort_keys=True).
+        """
+        return {
+            "provider_id": self.provider_id,
+            "requested_model_id": self.requested_model_id,
+            "adapter_version": self.adapter_version,
+            "prompt": dict(self.prompt),
+            "provider_options": dict(self.provider_options),
+            "scene": dict(self.scene),
+            "profile": {
+                "profile_id": self.profile["profile_id"],
+                "resolved_profile_sha256": self.profile["resolved_profile_sha256"],
+                "ordered_criteria": list(self.profile["ordered_criteria"]),
+            },
+            "images": [dict(img) for img in self.images],
+            "transcript_context": dict(self.transcript_context),
+            "response_schema": dict(self.response_schema),
+        }
+
+    def canonical_sha256(self) -> str:
+        """SHA-256 of the canonical JSON representation."""
+        canonical = json.dumps(
+            self.to_canonical_identity_dict(),
+            sort_keys=True, separators=(",", ":"),
+            ensure_ascii=False, allow_nan=False,
+        ).encode("utf-8")
+        return hashlib.sha256(canonical).hexdigest()
+
+
+@dataclass
+class ProviderContentBundle:
+    """Non-serializable in-memory content payload for provider construction.
+
+    NOT part of cache identity. MUST be built from verified semantic request
+    fields. The image_bytes list is in the same order as semantic_request.images.
+    transcript_excerpt is the raw UTF-8 text if mode=="included", else None.
+
+    This object is never serialized, logged, or stored in cache.
+    """
+    image_bytes: list[bytes]         # raw JPEG bytes; order matches semantic_request.images
+    transcript_excerpt: str | None   # raw UTF-8 text or None if not included

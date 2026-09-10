@@ -4,7 +4,7 @@ LAZY IMPORT: openai is NOT imported at module level.
 Requires explicit consent flags: --allow-external-upload and OPENAI_API_KEY.
 Uses Base64 data URLs for keyframes (ephemeral, NOT Files API, NOT public URLs).
 
-Official API contract (verified 2026-09-04):
+Official API contract (verified 2026-09-09):
   POST /v1/chat/completions
   model: gpt-4o (or user-specified vision-capable model)
   messages[0].content: list of image_url + text parts
@@ -24,11 +24,14 @@ import base64
 import json
 import os
 import time
-from pathlib import Path
 
-from auto_video_editor.analysis.models import DimensionScore, Keyframe, Scene, SceneScore
+from auto_video_editor.analysis.models import (
+    DimensionScore,
+    ProviderContentBundle,
+    SceneScore,
+    SceneVisionSemanticRequest,
+)
 from auto_video_editor.analysis.scoring.base import PROMPT_VERSION
-from auto_video_editor.profiles.models import ContentProfile
 
 _MAX_RETRIES = 3
 _MAX_TOTAL_S = 60.0
@@ -78,61 +81,63 @@ class OpenAIVisionBackend:
 
     def score_scene(
         self,
-        scene: Scene,
-        keyframes: list[Keyframe],
-        profile: ContentProfile,
-        transcript_context: str | None,
+        semantic_request: SceneVisionSemanticRequest,
+        content: ProviderContentBundle,
     ) -> SceneScore:
+        """Score one scene using OpenAI Vision API.
+
+        Builds prompt and image content from the validated semantic request
+        and content bundle. No raw bytes or API keys are stored.
+        """
         client = self._get_client()
-        ok_kf = [kf for kf in keyframes if kf.status == "ok" and kf.sha256]
+        ordered_criteria = semantic_request.profile.get("ordered_criteria", [])
+        image_bytes_list = content.image_bytes
+        n_images = len(image_bytes_list)
 
-        if not ok_kf:
-            dims = tuple(
-                DimensionScore(dim, w, None, None, "insufficient_evidence")
-                for dim, w in profile.scoring.items()
-            )
-            return SceneScore(
-                scene_index=scene.index,
-                provider="openai",
-                model_id=self._model,
-                prompt_version=PROMPT_VERSION,
-                dimensions=dims,
-                weighted_score=None,
-                keyframes_used=0,
-                status="insufficient_evidence",
+        if n_images == 0:
+            return _make_insufficient(
+                semantic_request.scene["scene_id"], self._model, 0
             )
 
-        # Build prompt listing dimensions dynamically (no profile-ID branches)
+        # Build prompt from semantic request fields (no absolute paths, no keys)
         dimensions_list = ", ".join(
-            f"{dim}(weight={w})" for dim, w in profile.scoring.items()
+            f"{c['criterion_id']}(weight={c['finite_weight']:.0f})"
+            for c in ordered_criteria
         )
+        scene = semantic_request.scene
+        start_s = scene["start_us"] / 1_000_000
+        end_s = scene["end_us"] / 1_000_000
         prompt_text = (
             f"You are a professional video quality evaluator for short-form social media.\n"
-            f"Evaluate these {len(ok_kf)} keyframe(s) from a scene "
-            f"({scene.start_seconds:.2f}s – {scene.end_seconds:.2f}s).\n"
+            f"Evaluate these {n_images} keyframe(s) from a scene "
+            f"({start_s:.2f}s – {end_s:.2f}s).\n"
             f"Scoring dimensions (name:weight out of 100): {dimensions_list}.\n"
         )
-        if transcript_context:
-            prompt_text += f"Transcript context: \"{transcript_context[:500]}\"\n"
+        # Transcript context: read ONLY from content bundle (not from semantic request)
+        if (
+            semantic_request.transcript_context.get("mode") == "included"
+            and content.transcript_excerpt
+        ):
+            prompt_text += f"Transcript context: \"{content.transcript_excerpt[:500]}\"\n"
         prompt_text += (
             "Return JSON with keys: dimensions (array of objects with dimension, "
             "score 0-100, confidence 0-1, status 'scored'|'insufficient_evidence'), "
             "reasoning (string, max 100 chars)."
         )
 
-        # Build response schema dynamically from profile dimensions
-        dim_names = list(profile.scoring.weights.keys())
+        # Build response schema from ordered criteria
+        dim_names = [c["criterion_id"] for c in ordered_criteria]
         schema = _build_response_schema(dim_names)
 
-        # Build message content with images
-        content: list[dict] = []
-        for kf in ok_kf:
-            b64 = _encode_image(kf.path)
-            content.append({
+        # Build image content from bytes in content bundle (Base64 ephemeral)
+        message_content: list[dict] = []
+        for img_bytes in image_bytes_list:
+            b64 = base64.b64encode(img_bytes).decode("ascii")
+            message_content.append({
                 "type": "image_url",
                 "image_url": {"url": f"data:image/jpeg;base64,{b64}"},
             })
-        content.append({"type": "text", "text": prompt_text})
+        message_content.append({"type": "text", "text": prompt_text})
 
         # Retry loop
         start_time = time.monotonic()
@@ -143,7 +148,7 @@ class OpenAIVisionBackend:
             try:
                 response = client.chat.completions.create(
                     model=self._model,
-                    messages=[{"role": "user", "content": content}],
+                    messages=[{"role": "user", "content": message_content}],
                     response_format={
                         "type": "json_schema",
                         "json_schema": {
@@ -154,14 +159,21 @@ class OpenAIVisionBackend:
                     },
                     timeout=30,
                 )
-                # Check for refusal
                 choice = response.choices[0]
                 if getattr(choice.message, "refusal", None):
-                    return _make_insufficient(scene, self._model, len(ok_kf))
+                    return _make_insufficient(
+                        semantic_request.scene["scene_id"], self._model, n_images
+                    )
 
                 raw = choice.message.content
                 parsed = json.loads(raw)
-                return _build_scene_score(scene, self._model, parsed, ok_kf, profile)
+                return _build_scene_score(
+                    semantic_request.scene["scene_id"],
+                    self._model,
+                    parsed,
+                    n_images,
+                    ordered_criteria,
+                )
 
             except Exception as exc:  # noqa: BLE001
                 status_code = getattr(exc, "status_code", None)
@@ -179,11 +191,6 @@ class OpenAIVisionBackend:
         raise RuntimeError(
             f"OpenAI backend failed after {_MAX_RETRIES} attempts: {last_exc}"
         )
-
-
-def _encode_image(path: str) -> str:
-    with open(path, "rb") as f:
-        return base64.b64encode(f.read()).decode("ascii")
 
 
 def _get_retry_after(exc: Exception) -> float | None:
@@ -225,17 +232,19 @@ def _build_response_schema(dim_names: list[str]) -> dict:
 
 
 def _build_scene_score(
-    scene: Scene,
+    scene_id: int,
     model: str,
     parsed: dict,
-    ok_kf: list[Keyframe],
-    profile: ContentProfile,
+    n_images: int,
+    ordered_criteria: list[dict],
 ) -> SceneScore:
     import math as _math  # noqa: PLC0415
     api_dims = {d["dimension"]: d for d in parsed.get("dimensions", [])}
     dims = []
 
-    for dim, weight in profile.scoring.items():
+    for c in ordered_criteria:
+        dim = c["criterion_id"]
+        weight = int(c["finite_weight"])
         api_d = api_dims.get(dim)
         if api_d and api_d.get("status") == "scored":
             raw_score = api_d["score"]
@@ -245,7 +254,6 @@ def _build_scene_score(
         else:
             dims.append(DimensionScore(dim, weight, None, None, "insufficient_evidence"))
 
-    # Correct scoring contract: no renormalization
     scored_dims = [
         d for d in dims
         if d.status == "scored" and d.score is not None and _math.isfinite(d.score)
@@ -256,7 +264,7 @@ def _build_scene_score(
     weighted_score = partial_ws if score_coverage_percent == 100.0 else None
 
     return SceneScore(
-        scene_index=scene.index,
+        scene_index=scene_id,
         provider="openai",
         model_id=model,
         prompt_version=PROMPT_VERSION,
@@ -264,20 +272,20 @@ def _build_scene_score(
         score_coverage_percent=score_coverage_percent,
         partial_weighted_score=partial_ws,
         weighted_score=weighted_score,
-        keyframes_used=len(ok_kf),
+        keyframes_used=n_images,
         status="scored" if scored_dims else "insufficient_evidence",
     )
 
 
-def _make_insufficient(scene: Scene, model: str, kf_used: int) -> SceneScore:
+def _make_insufficient(scene_id: int, model: str, kf_used: int) -> SceneScore:
     return SceneScore(
-        scene_index=scene.index,
+        scene_index=scene_id,
         provider="openai",
         model_id=model,
         prompt_version=PROMPT_VERSION,
         dimensions=(),
         score_coverage_percent=0.0,
-        partial_weighted_score=0.0,  # numeric zero, not null
+        partial_weighted_score=0.0,
         weighted_score=None,
         keyframes_used=kf_used,
         status="insufficient_evidence",
