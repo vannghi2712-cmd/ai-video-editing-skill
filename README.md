@@ -1,4 +1,4 @@
-﻿# ðŸŽ¬ Vlog Auto Edit â€” AI Agent è‡ªåŠ¨å‰ªè¾‘æ—…è¡Œ Vlog
+# ðŸŽ¬ Vlog Auto Edit â€” AI Agent è‡ªåŠ¨å‰ªè¾‘æ—…è¡Œ Vlog
 
 > æŠŠä¸€å †æ‰‹æœºæ‹çš„æ—…è¡Œç´ æï¼Œç”¨ AI Agent è‡ªåŠ¨å‰ªæˆä¸€ä¸ªå®Œæ•´ Vlogã€‚
 > ä½ åªéœ€è¦æä¾›ç´ ææ–‡ä»¶å¤¹ï¼Œå‰©ä¸‹çš„äº¤ç»™ Agentã€‚
@@ -341,3 +341,46 @@ Transcribe a video:
 Outputs: 	ranscript.json, 	ranscript.srt, words.json, manifest.json.
 
 See [docs/TRANSCRIPTION_GUIDE.md](docs/TRANSCRIPTION_GUIDE.md) for full documentation.
+
+---
+
+## Phase 4 — Scene Analysis & Vision Scoring
+
+> **Status: IMPLEMENTED (mock pipeline). Live OpenAI Vision: NOT_RUN.**
+> Cache schema: 4.0.0 · Output schema: 2.0.0 · Vision adapter: 1.3.0
+> Phase 5: LOCKED.
+
+Analyze a video with the mock backend:
+
+```powershell
+.\.venv\Scripts\python.exe -m auto_video_editor analyze scenes `
+  --input path/to/video.mp4 --profile food_review `
+  --output-dir path/to/output/ --provider mock
+```
+
+### Exit Codes
+
+| Code | Meaning |
+|---|---|
+| 0 | Success |
+| 3 | Profile error |
+| 4 | Media error |
+| 5 | Schema/output/ownership/legacy-v1 error |
+| 6 | Consent error |
+| 7 | Partial — some scenes failed |
+| 8 | Backend error |
+| 9 | Content integrity failure (SHA mismatch) |
+
+### Security Hardening (Correction 3, 2026-09-11)
+
+- `SceneVisionSemanticRequest` carries `source_sha256` directly — validated 64-hex, lowercase-normalized.
+- `ProviderContentBundle` is frozen (`tuple[bytes,...]`); bundle verified against semantic descriptor at two points (before cache lookup and before provider call).
+- Keyframe SHA mismatch → fail-closed (exit 9); case-insensitive comparison.
+- Atomic I/O: `mkstemp → flush → fsync → os.replace → re-read → verify SHA`.
+- `WriterLock` (O_CREAT|O_EXCL) prevents concurrent cache writers.
+- Cache publication: `clip_analysis.json` first, `manifest.json` last (contains artifact SHA).
+- Symlinks and Windows reparse points rejected before `resolve()`.
+- Legacy v1 output (`schema_version==1.0.0`) rejected even with `--force`.
+- OpenAI optional dependency: `openai==3.13.0` (verified PyPI 2026-09-11). Chat Completions API.
+
+See [docs/VISION_ANALYSIS_GUIDE.md](docs/VISION_ANALYSIS_GUIDE.md) for full documentation.

@@ -47,10 +47,34 @@ python -m auto_video_editor analyze scenes \
 | 2 | Syntax error |
 | 3 | Profile error |
 | 4 | Media inspection error |
-| 5 | Schema/Output ownership error |
+| 5 | Schema/Output ownership error or Legacy v1 rejection |
 | 6 | Auth/Consent error |
 | 7 | Partial (some scenes failed scoring) |
 | 8 | Backend execution error |
+| 9 | Content integrity failure (keyframe or bundle SHA mismatch) |
+
+## Content Integrity (Correction 3, 2026-09-11)
+
+### SceneVisionSemanticRequest
+- `source_sha256` is a **required direct field** — exactly 64 hex chars, normalized lowercase.
+- Changing source SHA changes `canonical_sha256()` and the cache job ID.
+- Canonical serialization: `json.dumps(sort_keys=True, separators=(",",":"), allow_nan=False)`.
+
+### ProviderContentBundle
+- Frozen dataclass: `image_bytes: tuple[bytes, ...]`, `transcript_excerpt: str | None`.
+- `validate_content_bundle_against_semantic_request()` verifies: image count, SHA-256, JPEG magic, JPEG dimensions, frame order, transcript consent mode, transcript hash, char count.
+- Mismatch raises `ProviderContentIntegrityError(ValueError)` — no raw bytes in error message.
+
+### Two-Point Verification
+- **Point A**: before `cache.get()` — cache cannot restore mismatched content.
+- **Point B**: before `backend.score_scene()` (cache miss only).
+- Cache hit: Point A only; provider never constructed.
+- Cache miss: Point A + Point B.
+
+### Keyframe Mismatch
+- SHA mismatch is **fail-closed** — exits with code 9.
+- SHA comparison is case-insensitive (extractor may store uppercase).
+- No silent continuation, no `insufficient_evidence` downgrade.
 
 ## Scoring Contract
 
@@ -75,15 +99,24 @@ Without these flags, the pipeline exits with code 6 (consent error) before any u
 
 - If the output directory is non-empty and has no `manifest.json` → rejected (exit 5).
 - If the manifest has a different `source_sha256` → rejected even with `--force`.
-- `--force` can only overwrite artifacts declared by a valid, same-source manifest.
+- Symlinks and Windows reparse points → rejected before `resolve()` even with `--force`.
+- Legacy v1 output (`schema_version == "1.0.0"`) → rejected even with `--force`.
+- `--force` can only overwrite artifacts declared by a valid, same-source, non-symlink, non-v1 manifest.
 
-## Cache
+## Cache (v4.0.0)
 
-Two-level content-addressed cache (version 2.0.0):
+Two-level content-addressed cache (schema version 4.0.0):
 - **Level A (Preprocessing):** source SHA + tool versions + detector/extractor config.
-- **Level B (Provider):** Level A + ordered keyframe SHAs + profile + provider + model + schema + transcript context mode/hash + upload mode + canonical request payload hash.
+- **Level B (Provider):** Level A + ordered per-scene `SceneVisionSemanticRequest` canonical dicts
+  (each includes `source_sha256`, keyframe SHAs, profile hash, provider, model, prompt hash, schema hash, transcript consent/hash).
 
-Old caches (v1.0.0) are safely ignored (version mismatch = cache miss).
+Atomic write contract:
+- `clip_analysis.json` written FIRST, `manifest.json` LAST.
+- Manifest contains `clip_analysis_sha256`; `cache.get()` verifies before returning.
+- Wrong SHA → safe miss. Old schema (v1.0.0) → rejection.
+- `WriterLock` (O_CREAT|O_EXCL) prevents concurrent writers.
+
+Old caches (v≠4.0.0) are safely ignored (version mismatch = cache miss).
 
 ## Live Vision (NOT RUN)
 
@@ -95,6 +128,8 @@ Live OpenAI Vision execution has not been tested. The OpenAI adapter is implemen
 - Live image submission: `NOT_RUN` / `UNVERIFIED`
 - Live Structured Outputs: `NOT_RUN` / `UNVERIFIED`
 - Live refusal/retry: `NOT_RUN` / `UNVERIFIED`
+
+OpenAI optional dependency: `openai==3.13.0` (verified PyPI, 2026-09-11). Chat Completions API.
 
 To use live OpenAI Vision, set `OPENAI_API_KEY` and pass `--allow-external-upload`.
 

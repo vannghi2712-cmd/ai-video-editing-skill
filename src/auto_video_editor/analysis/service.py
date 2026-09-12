@@ -2,26 +2,45 @@
 
 No hard-coded profile-ID branches.
 No shell=True. No GPU/CUDA.
-Ownership: --force cannot override source SHA mismatch.
+Ownership: --force cannot override source SHA mismatch or legacy-v1 output.
 
 Cache order (ENFORCED):
   1. Inspect source  2. Source SHA  3. Scene boundaries
   4. Preprocessing identity  5. Extract keyframes
-  6. VERIFY KEYFRAME BYTES & RECALCULATE SHA-256
-  7. Build per-scene SemanticRequests + ContentBundles (verifies all bytes)
-  8. Aggregate canonical identity  9. Semantic job SHA
-  10. Provider cache lookup (ONLY after steps 6-9 complete)
+  6. VERIFY KEYFRAME BYTES & RECALCULATE SHA-256 (fail-closed on mismatch)
+  7. Build per-scene SemanticRequests + ContentBundles
+  8. Point A: validate_content_bundle_against_semantic_request() per scene
+  9. Aggregate canonical identity  10. Semantic job SHA
+  11. Provider cache lookup (ONLY after steps 6-10 complete)
+  12. Point B: validate_content_bundle_against_semantic_request() per scene (cache miss only)
+  13. Provider invocation (cache miss only)
+
+Symlink/reparse protection:
+  Raw output path is checked via is_symlink() and Windows reparse attribute
+  BEFORE resolve() is ever called. Symlinks and reparse points are rejected.
+
+Legacy v1 protection:
+  If clip_analysis.json already exists with schema_version=="1.0.0", the
+  pipeline raises LegacyOutputSchemaError (exit 5) without any mutation,
+  regardless of --force.
 """
 from __future__ import annotations
 
 import hashlib
 import json
 import os
-import tempfile
+import stat as _stat
 import time
 import uuid
 from pathlib import Path
 
+from auto_video_editor.analysis.atomic_io import (
+    ArtifactIntegrityError,
+    WriterLock,
+    WriterLockError,
+    atomic_write_bytes,
+    atomic_write_text,
+)
 from auto_video_editor.analysis.cache import (
     CACHE_SCHEMA_VERSION,
     VISION_ADAPTER_VERSION,
@@ -35,8 +54,11 @@ from auto_video_editor.analysis.keyframe_extractor import extract_keyframes
 from auto_video_editor.analysis.media_inspector import inspect_media
 from auto_video_editor.analysis.models import (
     ClipAnalysis,
+    LegacyOutputSchemaError,
     ProviderContentBundle,
+    ProviderContentIntegrityError,
     SceneVisionSemanticRequest,
+    validate_content_bundle_against_semantic_request,
 )
 from auto_video_editor.analysis.scene_detector import detect_scenes
 from auto_video_editor.analysis.scoring.base import PROMPT_VERSION, VISION_ADAPTER_VERSION as _ADAPTER_VER
@@ -55,6 +77,16 @@ _MANIFEST_VERSION = "1.0.0"
 _ROOT_MARKER_FILENAME = ".scene_analysis_root"
 
 _TOOL_VERSION_UNKNOWN = "unknown"
+
+# Exit codes
+EXIT_SUCCESS = 0
+EXIT_PROFILE_ERROR = 3
+EXIT_MEDIA_ERROR = 4
+EXIT_SCHEMA_OUTPUT_ERROR = 5
+EXIT_CONSENT_ERROR = 6
+EXIT_PARTIAL = 7
+EXIT_BACKEND_ERROR = 8
+EXIT_CONTENT_INTEGRITY_ERROR = 9
 
 # SHA-256 of the prompt template string used by all providers.
 # Recompute if the prompt template content changes.
@@ -92,27 +124,9 @@ def _read_root_marker(out_dir: Path) -> str | None:
 
 
 def _write_root_marker(out_dir: Path, root_id: str) -> None:
-    (out_dir / _ROOT_MARKER_FILENAME).write_text(root_id, encoding="utf-8")
-
-
-def _atomic_write(path: Path, data: bytes) -> None:
-    """Write data atomically: write to temp file then os.replace() (same directory)."""
-    parent = path.parent
-    fd, tmp_path = tempfile.mkstemp(dir=str(parent), prefix=".tmp_", suffix=path.suffix)
-    try:
-        with os.fdopen(fd, "wb") as f:
-            f.write(data)
-        os.replace(tmp_path, str(path))
-    except Exception:
-        try:
-            os.unlink(tmp_path)
-        except Exception:  # noqa: BLE001
-            pass
-        raise
-
-
-def _atomic_write_text(path: Path, text: str, encoding: str = "utf-8") -> None:
-    _atomic_write(path, text.encode(encoding))
+    """Atomically write the root marker file (written once, never rotated)."""
+    marker_path = out_dir / _ROOT_MARKER_FILENAME
+    atomic_write_text(marker_path, root_id)
 
 
 def _jpeg_dimensions(data: bytes) -> tuple[int, int]:
@@ -134,12 +148,39 @@ def _jpeg_dimensions(data: bytes) -> tuple[int, int]:
     return 0, 0
 
 
+def _is_symlink_or_reparse(path: Path) -> bool:
+    """Return True if path is a symlink or Windows reparse point.
+
+    Uses lstat() to check the raw path WITHOUT following any links.
+    This check MUST be done before resolve() to prevent symlink-based bypass.
+    """
+    if path.is_symlink():
+        return True
+    # Windows reparse point check via st_file_attributes
+    try:
+        lst = path.lstat()
+        reparse_flag = getattr(_stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+        win_attrs = getattr(lst, "st_file_attributes", 0)
+        if win_attrs & reparse_flag:
+            return True
+    except (OSError, AttributeError):
+        pass
+    return False
+
+
 def _check_ownership(out_dir: Path, source_sha256: str, force: bool) -> tuple[bool, str]:
+    # ── Raw-path symlink/reparse check FIRST (before resolve) ──────────────
+    if out_dir.exists() and _is_symlink_or_reparse(out_dir):
+        return False, (
+            "Output dir is a symlink or Windows reparse point. "
+            "Use a real directory as --output-dir."
+        )
+
     if not out_dir.exists():
         return True, ""
     try:
         if not out_dir.resolve().is_dir():
-            return False, "Output dir is not a regular directory (symlink or missing)."
+            return False, "Output dir is not a regular directory."
     except Exception:  # noqa: BLE001
         return False, "Output dir cannot be resolved."
 
@@ -191,33 +232,58 @@ def _check_ownership(out_dir: Path, source_sha256: str, force: bool) -> tuple[bo
 
 
 def _verify_keyframe_bytes(keyframes) -> list:
-    """Recompute SHA-256 from bytes on disk for each ok keyframe."""
+    """Recompute SHA-256 from bytes on disk for each ok keyframe.
+
+    SHA comparison is case-insensitive: the keyframe extractor stores uppercase
+    hex digests; hashlib always returns lowercase. Normalization is applied to
+    both sides so case difference is never a false-positive integrity failure.
+
+    Raises ProviderContentIntegrityError only when actual content differs.
+    Always returns keyframes with SHA-256 normalized to lowercase.
+    """
     verified = []
     for kf in keyframes:
         if kf.status == "ok" and kf.path:
             disk_sha = AnalysisCache.verify_keyframe_sha256(kf.path)
-            if disk_sha and disk_sha != kf.sha256:
-                from auto_video_editor.analysis.models import Keyframe  # noqa: PLC0415
-                kf = Keyframe(kf.scene_index, kf.slot, kf.timestamp_us, kf.path, disk_sha, kf.status)
+            if disk_sha is None:
+                # File unreadable — keep keyframe as-is; will be excluded downstream
+                verified.append(kf)
+                continue
+            disk_sha_lower = disk_sha.lower()
+            stored_sha_lower = (kf.sha256 or "").lower()
+            if disk_sha_lower != stored_sha_lower:
+                raise ProviderContentIntegrityError(
+                    f"Keyframe SHA-256 mismatch for scene={kf.scene_index} slot={kf.slot}: "
+                    f"expected suffix ...{stored_sha_lower[-12:]}, "
+                    f"on-disk suffix ...{disk_sha_lower[-12:]}"
+                )
+            # Normalize SHA to lowercase in the stored keyframe object
+            from auto_video_editor.analysis.models import Keyframe  # noqa: PLC0415
+            kf = Keyframe(
+                kf.scene_index, kf.slot, kf.timestamp_us, kf.path,
+                disk_sha_lower, kf.status,
+            )
         verified.append(kf)
     return verified
+
 
 
 def _build_semantic_request(
     scene,
     ok_kf,
-    image_bytes_list: list[bytes],
+    image_bytes_tuple: tuple[bytes, ...],
     profile,
     profile_hash: str,
     config: AnalysisConfig,
     schema_sha: str,
     ctx_text: str | None,
+    source_sha256: str,
 ) -> tuple[SceneVisionSemanticRequest, ProviderContentBundle]:
     """Build one immutable SceneVisionSemanticRequest and its ProviderContentBundle."""
 
     # Image descriptors — SHAs from actual bytes (already verified)
     images = []
-    for order, (kf, b) in enumerate(zip(ok_kf, image_bytes_list)):
+    for order, (kf, b) in enumerate(zip(ok_kf, image_bytes_tuple)):
         w, h = _jpeg_dimensions(b)
         sha = hashlib.sha256(b).hexdigest()
         images.append({
@@ -247,6 +313,7 @@ def _build_semantic_request(
     ]
 
     semantic_req = SceneVisionSemanticRequest(
+        source_sha256=source_sha256.lower(),
         provider_id=config.provider,
         requested_model_id=config.vision_model or "",
         adapter_version=_ADAPTER_VER,
@@ -279,7 +346,7 @@ def _build_semantic_request(
     )
 
     bundle = ProviderContentBundle(
-        image_bytes=list(image_bytes_list),
+        image_bytes=image_bytes_tuple,
         transcript_excerpt=ctx_text if ctx_mode == "included" else None,
     )
 
@@ -293,7 +360,8 @@ class AnalysisService:
         """Execute the analysis pipeline.
 
         Returns (exit_code, message).
-          0=success, 3=profile, 4=media, 5=schema/output, 6=consent, 7=partial, 8=backend
+          0=success, 3=profile, 4=media, 5=schema/output/legacy-v1, 6=consent,
+          7=partial, 8=backend, 9=content-integrity
         """
         t_start = time.monotonic()
         warnings: list[str] = []
@@ -301,19 +369,19 @@ class AnalysisService:
 
         # ── Consent checks ────────────────────────────────────────────────────
         if config.provider == "openai" and not config.allow_external_upload:
-            return 6, (
+            return EXIT_CONSENT_ERROR, (
                 "External upload requires --allow-external-upload. "
                 "Keyframes would be sent to OpenAI API."
             )
         if config.provider == "openai":
             if not os.environ.get("OPENAI_API_KEY"):
-                return 6, "OPENAI_API_KEY environment variable is not set."
+                return EXIT_CONSENT_ERROR, "OPENAI_API_KEY environment variable is not set."
 
         # ── Load profile ──────────────────────────────────────────────────────
         try:
             profile = load_profile(config.profile_id)
         except Exception as exc:  # noqa: BLE001
-            return 3, f"Profile error: {exc}"
+            return EXIT_PROFILE_ERROR, f"Profile error: {exc}"
 
         profile_dict = profile.to_dict()
         profile_hash = AnalysisCache.profile_hash(profile_dict)
@@ -322,7 +390,7 @@ class AnalysisService:
         try:
             media_info, media_warnings = inspect_media(config.input_path)
         except Exception as exc:  # noqa: BLE001
-            return 4, f"Media inspection failed: {exc}"
+            return EXIT_MEDIA_ERROR, f"Media inspection failed: {exc}"
         warnings.extend(media_warnings)
 
         # ── Dry-run ───────────────────────────────────────────────────────────
@@ -334,19 +402,48 @@ class AnalysisService:
                 f"~{est_kf} keyframes (~{est_kf * 150_000 // 1024}KB), "
                 f"{est_scenes if config.provider == 'openai' else 0} API calls"
             )
-            return 0, "Dry-run complete"
+            return EXIT_SUCCESS, "Dry-run complete"
 
-        # ── Output directory ownership ────────────────────────────────────────
+        # ── Output directory: raw-path checks before resolve ──────────────────
         out_dir.mkdir(parents=True, exist_ok=True)
+
+        # ── Ownership check (includes symlink/reparse rejection) ──────────────
+        ok, err_msg = _check_ownership(out_dir, media_info.sha256, config.force)
+        if not ok:
+            return EXIT_SCHEMA_OUTPUT_ERROR, err_msg
+
+        # ── Root marker (written once; never rotated) ─────────────────────────
+        marker_path = out_dir / _ROOT_MARKER_FILENAME
         marker_id = _read_root_marker(out_dir)
         if marker_id is None:
             marker_id = str(uuid.uuid4())
             _write_root_marker(out_dir, marker_id)
 
-        ok, err_msg = _check_ownership(out_dir, media_info.sha256, config.force)
-        if not ok:
-            return 5, err_msg
         manifest_path = out_dir / "manifest.json"
+
+        # ── Legacy v1 output detection (BEFORE any mutation) ──────────────────
+        # If clip_analysis.json exists with schema_version==1.0.0, reject.
+        # --force does NOT bypass this check.
+        existing_analysis_path = out_dir / "clip_analysis.json"
+        if existing_analysis_path.exists():
+            try:
+                existing_data = json.loads(
+                    existing_analysis_path.read_text(encoding="utf-8")
+                )
+                if existing_data.get("schema_version") == "1.0.0":
+                    raise LegacyOutputSchemaError(
+                        "Existing clip_analysis.json has schema_version='1.0.0' (legacy V1). "
+                        "This directory requires manual migration. "
+                        "--force does not bypass legacy V1 rejection."
+                    )
+            except LegacyOutputSchemaError:
+                return EXIT_SCHEMA_OUTPUT_ERROR, (
+                    "Existing output contains legacy V1 schema (1.0.0). "
+                    "Manual migration required; pipeline stopped without mutation."
+                )
+            except Exception:  # noqa: BLE001
+                # Unreadable / invalid JSON — proceed; schema validation later will catch issues
+                pass
 
         # ── Transcript ────────────────────────────────────────────────────────
         transcript_dict: dict | None = None
@@ -366,7 +463,7 @@ class AnalysisService:
                 config.input_path, media_info.duration_us, config.detector
             )
         except Exception as exc:  # noqa: BLE001
-            return 8, f"Scene detection failed: {exc}"
+            return EXIT_BACKEND_ERROR, f"Scene detection failed: {exc}"
         warnings.extend(scene_warnings)
 
         # ── Step 4: Preprocessing identity ───────────────────────────────────
@@ -385,11 +482,15 @@ class AnalysisService:
                 config.input_path, scenes, out_dir, slots=config.keyframe_slots
             )
         except Exception as exc:  # noqa: BLE001
-            return 8, f"Keyframe extraction failed: {exc}"
+            return EXIT_BACKEND_ERROR, f"Keyframe extraction failed: {exc}"
         warnings.extend(kf_warnings)
 
         # ── Step 6: VERIFY KEYFRAME BYTES & RECALCULATE SHA-256 ──────────────
-        keyframes = _verify_keyframe_bytes(keyframes)
+        # FAIL-CLOSED: ProviderContentIntegrityError if SHA mismatch detected
+        try:
+            keyframes = _verify_keyframe_bytes(keyframes)
+        except ProviderContentIntegrityError as exc:
+            return EXIT_CONTENT_INTEGRITY_ERROR, f"Keyframe integrity failure: {exc}"
 
         # ── Associate transcript ──────────────────────────────────────────────
         transcript_associations = associate_transcript(
@@ -400,7 +501,7 @@ class AnalysisService:
         schema_sha = AnalysisCache.output_schema_sha256(_SCHEMA_PATH)
 
         # ── Step 7: Build per-scene SemanticRequests + ContentBundles ─────────
-        # All keyframe bytes verified in step 6. Image bytes re-read here.
+        source_sha256_lower = media_info.sha256.lower()
         semantic_requests: list[SceneVisionSemanticRequest] = []
         content_bundles: list[ProviderContentBundle] = []
 
@@ -408,22 +509,17 @@ class AnalysisService:
             scene_kf = [kf for kf in keyframes if kf.scene_index == scene.index]
             ok_kf = [kf for kf in scene_kf if kf.status == "ok" and kf.sha256]
 
-            # Read and verify image bytes for this scene
+            # Read image bytes for this scene
             image_bytes_list: list[bytes] = []
             verified_kf = []
             for kf in ok_kf:
                 try:
                     b = Path(kf.path).read_bytes()
-                    disk_sha = hashlib.sha256(b).hexdigest()
-                    if disk_sha != kf.sha256:
-                        warnings.append(
-                            f"Scene {scene.index}: keyframe SHA mismatch "
-                            f"(expected {kf.sha256[:8]}…, got {disk_sha[:8]}…)"
-                        )
-                    image_bytes_list.append(b)
-                    verified_kf.append(kf)
                 except Exception as exc:  # noqa: BLE001
                     warnings.append(f"Scene {scene.index}: cannot read keyframe: {exc}")
+                    continue
+                image_bytes_list.append(b)
+                verified_kf.append(kf)
 
             ctx_obj = transcript_associations.get(scene.index)
             ctx_text = (
@@ -433,32 +529,52 @@ class AnalysisService:
             )
 
             sem_req, bundle = _build_semantic_request(
-                scene, verified_kf, image_bytes_list,
+                scene, verified_kf, tuple(image_bytes_list),
                 profile, profile_hash, config, schema_sha, ctx_text,
+                source_sha256=source_sha256_lower,
             )
             semantic_requests.append(sem_req)
             content_bundles.append(bundle)
 
-        # ── Step 8-9: Aggregate canonical identity → job SHA ──────────────────
+        # ── Step 8: Point A — Validate all bundles BEFORE cache lookup ────────
+        for sem_req, bundle in zip(semantic_requests, content_bundles):
+            try:
+                validate_content_bundle_against_semantic_request(sem_req, bundle)
+            except ProviderContentIntegrityError as exc:
+                return EXIT_CONTENT_INTEGRITY_ERROR, (
+                    f"Content bundle integrity failure (Point A) for "
+                    f"scene {sem_req.scene.get('scene_id', '?')}: {exc}"
+                )
+
+        # ── Step 9-10: Aggregate canonical identity → job SHA ─────────────────
         scene_canonical_dicts = [req.to_canonical_identity_dict() for req in semantic_requests]
         job_id = semantic_request_job_id(
             preprocessing_sha256=pre_id,
             scene_canonical_dicts=scene_canonical_dicts,
         )
 
-        # ── Step 10: Provider cache lookup (ONLY after verified semantic reqs) ─
+        # ── Step 11: Provider cache lookup (ONLY after Point A) ───────────────
         cache = AnalysisCache(config.cache_dir)
         if config.resume and not config.force:
             cached = cache.get(job_id)
             if cached:
                 print("Cache hit (OK) -- restoring from cache")
-                _atomic_write_text(
-                    out_dir / "clip_analysis.json",
-                    json.dumps(cached["analysis"], indent=2, ensure_ascii=False),
-                )
-                return 0, "Analysis restored from cache"
+                analysis_json = json.dumps(cached["analysis"], indent=2, ensure_ascii=False)
+                atomic_write_text(out_dir / "clip_analysis.json", analysis_json)
+                return EXIT_SUCCESS, "Analysis restored from cache"
 
-        # ── Vision backend ────────────────────────────────────────────────────
+        # ── Step 12: Point B — Validate bundles again BEFORE provider ────────
+        # (cache miss only; cache hit path does not reach here)
+        for sem_req, bundle in zip(semantic_requests, content_bundles):
+            try:
+                validate_content_bundle_against_semantic_request(sem_req, bundle)
+            except ProviderContentIntegrityError as exc:
+                return EXIT_CONTENT_INTEGRITY_ERROR, (
+                    f"Content bundle integrity failure (Point B) for "
+                    f"scene {sem_req.scene.get('scene_id', '?')}: {exc}"
+                )
+
+        # ── Step 13: Vision backend ───────────────────────────────────────────
         backend = _build_backend(config)
         scores = []
         backend_errors = 0
@@ -503,17 +619,27 @@ class AnalysisService:
             },
         )
 
-        # ── Export (atomic write) ─────────────────────────────────────────────
+        # ── Export and validate ───────────────────────────────────────────────
         analysis_json = export_clip_analysis(analysis)
 
         if _SCHEMA_PATH.exists():
             schema_errors = validate_against_schema(analysis_json, str(_SCHEMA_PATH))
             if schema_errors:
-                return 5, f"Schema validation failed: {'; '.join(schema_errors[:3])}"
+                return EXIT_SCHEMA_OUTPUT_ERROR, f"Schema validation failed: {'; '.join(schema_errors[:3])}"
 
-        _atomic_write_text(out_dir / "clip_analysis.json", analysis_json)
+        # ── Atomic write clip_analysis.json ───────────────────────────────────
+        analysis_bytes = analysis_json.encode("utf-8")
+        analysis_sha = hashlib.sha256(analysis_bytes).hexdigest()
+        try:
+            atomic_write_bytes(
+                out_dir / "clip_analysis.json",
+                analysis_bytes,
+                expected_sha256=analysis_sha,
+            )
+        except ArtifactIntegrityError as exc:
+            return EXIT_SCHEMA_OUTPUT_ERROR, f"Artifact integrity error writing clip_analysis.json: {exc}"
 
-        # ── Write manifest (atomic) ───────────────────────────────────────────
+        # ── Atomic write manifest.json (LAST) ─────────────────────────────────
         root_id = _read_root_marker(out_dir) or marker_id
         manifest = {
             "manifest_version": _MANIFEST_VERSION,
@@ -524,11 +650,16 @@ class AnalysisService:
             "profile_id": config.profile_id,
             "analysis_schema_version": _ANALYSIS_SCHEMA_VERSION,
             "cache_schema_version": CACHE_SCHEMA_VERSION,
+            "clip_analysis_sha256": analysis_sha,
             "generated_artifacts": [
                 "clip_analysis.json", "manifest.json", _ROOT_MARKER_FILENAME,
             ],
         }
-        _atomic_write_text(manifest_path, json.dumps(manifest, indent=2))
+        manifest_text = json.dumps(manifest, indent=2)
+        try:
+            atomic_write_text(manifest_path, manifest_text)
+        except ArtifactIntegrityError as exc:
+            return EXIT_SCHEMA_OUTPUT_ERROR, f"Artifact integrity error writing manifest.json: {exc}"
 
         # ── Cache store ───────────────────────────────────────────────────────
         cache.put(
@@ -548,10 +679,10 @@ class AnalysisService:
             print(f"  WARNING: {w}")
 
         if overall_status == "partial":
-            return 7, f"Partial - {backend_errors}/{n_scenes} scenes failed scoring"
+            return EXIT_PARTIAL, f"Partial - {backend_errors}/{n_scenes} scenes failed scoring"
         if overall_status == "failed":
-            return 8, "All scenes failed scoring"
-        return 0, "Success"
+            return EXIT_BACKEND_ERROR, "All scenes failed scoring"
+        return EXIT_SUCCESS, "Success"
 
 
 def _build_backend(config: AnalysisConfig):

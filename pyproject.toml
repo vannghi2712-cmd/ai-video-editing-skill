@@ -30,7 +30,7 @@ test = [
 # Optional OpenAI Vision adapter — lazy-imported, NEVER part of mandatory runtime.
 # Install only when using --provider openai.
 vision-openai = [
-    "openai==3.8.0",
+    "openai==3.13.0",
 ]
 
 [project.scripts]

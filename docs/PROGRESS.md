@@ -337,3 +337,88 @@ Phase 4 remains NOT implemented. Explicit authorization required.
 - 7 new tests: `TestClosureCorrections` extended with semantic request + version + LegacyOutputSchemaError tests
 - Network-denied synthetic smoke test PASS: VERSION_CHECK, LEGACY_REJECTION, SEMANTIC_REQUEST_SHA, MOCK_BACKEND_NEW_API, ATOMIC_WRITE
 
+---
+
+## Phase 4 — Targeted Contract Correction 3 (2026-09-11)
+
+### Objective
+Harden all Phase 4 Final Contract elements identified in the read-only acceptance audit as deficiencies or failures.
+
+### Corrections Applied
+
+**Fix 1 — Direct source_sha256 in SceneVisionSemanticRequest**
+- Added `source_sha256: str` as first field of the frozen dataclass.
+- `__post_init__` validates exactly 64 hexadecimal characters.
+- Normalized to lowercase in `to_canonical_identity_dict()`.
+- Changing source SHA now changes `canonical_sha256()` and the cache job ID.
+
+**Fix 2 — ProviderContentBundle immutability**
+- Converted to `frozen=True` dataclass with `image_bytes: tuple[bytes, ...]`.
+- Added `ProviderContentIntegrityError(ValueError)` typed exception.
+- Added `validate_content_bundle_against_semantic_request()` that checks:
+  image count, byte SHA-256, JPEG MIME magic, JPEG dimensions (where parseable),
+  frame order, transcript consent mode, transcript hash, transcript character count.
+- Error messages do not disclose raw bytes or transcript plaintext.
+
+**Fix 3 — Keyframe mismatch fail-closed**
+- `_verify_keyframe_bytes()` raises `ProviderContentIntegrityError` on SHA mismatch instead of warning and continuing.
+- SHA comparison is case-insensitive (extractor stores uppercase, hashlib returns lowercase).
+- All downstream steps (cache lookup, provider construction, output write) are blocked.
+- Exit code: `EXIT_CONTENT_INTEGRITY_ERROR = 9`.
+
+**Fix 4 — Two-point content verification**
+- Point A: `validate_content_bundle_against_semantic_request()` for every scene before `cache.get()`.
+- Point B: same validation before `backend.score_scene()` (cache miss only).
+- Cache hit uses Point A only; provider never constructed.
+
+**Fix 5 — Atomic I/O module (`atomic_io.py`)**
+- New shared module with `atomic_write_bytes()`, `atomic_write_text()`, `WriterLock`.
+- Contract: mkstemp → write → flush → fsync (best-effort on Windows) → os.replace → re-read → verify SHA.
+- `WriterLock` uses `os.O_CREAT | os.O_EXCL` for exclusive cache entry locking.
+- `ArtifactIntegrityError(OSError)` and `WriterLockError(OSError)` typed exceptions.
+
+**Fix 6 — Atomic cache publication**
+- `AnalysisCache.put()` now acquires `WriterLock`, atomically writes `clip_analysis.json` with post-replace hash, then `manifest.json` LAST.
+- Manifest contains `clip_analysis_sha256`.
+- `AnalysisCache.get()` verifies artifact SHA from manifest before returning.
+- Wrong manifest SHA → safe miss.
+
+**Fix 7 — Root marker atomicity**
+- `_write_root_marker()` now uses `atomic_write_text()` instead of `write_text()`.
+
+**Fix 8 — Symlink/reparse point protection**
+- `_is_symlink_or_reparse()` checks raw path via `is_symlink()` and `st_file_attributes & FILE_ATTRIBUTE_REPARSE_POINT`.
+- `_check_ownership()` calls this BEFORE `resolve()`.
+- `--force` does NOT bypass.
+
+**Fix 9 — Legacy v1 output detection**
+- Before writing output, reads existing `clip_analysis.json` if present.
+- If `schema_version == "1.0.0"`, returns exit 5 without any mutation.
+- `--force` does NOT bypass.
+
+**Fix 10 — OpenAI dependency pin**
+- `pyproject.toml` corrected from `openai==3.8.0` to `openai==3.13.0`.
+- Version verified via `pip index versions openai` (2026-09-11).
+- Installed and confirmed working in `.venv`.
+
+**Fix 11 — Documentation synchronization**
+- README.md, docs/VISION_ANALYSIS_GUIDE.md, docs/DEPENDENCY_AUDIT_PHASE4.md, docs/ARCHITECTURE.md, docs/PROGRESS.md all updated.
+
+**Fix 12 — Regression tests (35 new test methods)**
+- `TestSemanticRequestIdentity` (9 tests): source_sha256, invalid SHA rejection, canonical hash, job ID change.
+- `TestBundleIntegrity` (7 tests): SHA mismatch, count mismatch, MIME, transcript mismatch/consent.
+- `TestAtomicIO` (8 tests): atomic write, post-replace hash, WriterLock exclusivity, manifest-last, corrupt artifact safe miss.
+- `TestSymlinkRejection` (4 tests): symlink rejected, --force no bypass, mocked reparse rejected.
+- `TestLegacyV1Behavior` (3 tests): error type, v1 detection, byte-for-byte immutability.
+- `TestDependencyContract` (3 tests): pyproject.toml pin, mock does not import openai, lazy import.
+
+### Tests
+- **403 tests PASS, EXIT=0** (base env, 368 + 35 new)
+- Skipped: 2 symlink tests require admin on Windows (correctly skipped via `skipTest`)
+- ML environment: to be verified in final read-only pass
+
+### Status
+- `LIVE_VISION_STATUS: NOT_RUN`
+- `VISION_PROVIDER_RUNTIME_CONTRACT: UNVERIFIED`
+- Phase 5: LOCKED
+- Pending: final read-only SHA verification before Phase 4 is accepted

@@ -7,7 +7,8 @@ from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import dataclass, field
+import re
+from dataclasses import dataclass
 from typing import Any
 
 
@@ -20,6 +21,21 @@ class LegacyOutputSchemaError(ValueError):
     No silent conversion is performed.
     """
 
+
+class ProviderContentIntegrityError(ValueError):
+    """Raised when a ProviderContentBundle does not match its SemanticRequest.
+
+    This is a content-integrity failure, NOT an insufficient-evidence condition.
+    The message does NOT contain raw bytes, transcript plaintext, or private paths.
+    Exit code: EXIT_CONTENT_INTEGRITY_ERROR (9).
+    """
+
+
+_HEX64_RE = re.compile(r'^[0-9a-fA-F]{64}$')
+
+
+def _is_valid_sha256(value: str) -> bool:
+    return bool(_HEX64_RE.match(value))
 
 
 # ── Media ─────────────────────────────────────────────────────────────────────
@@ -169,6 +185,7 @@ class SceneVisionSemanticRequest:
 
     Fields
     ------
+    source_sha256       : SHA-256 of the source media file (64 hex chars, normalized lowercase)
     provider_id         : "mock" | "openai"
     requested_model_id  : model name or "" for mock
     adapter_version     : "1.3.0"
@@ -184,6 +201,7 @@ class SceneVisionSemanticRequest:
                           content_sha256: SHA-256 of exact UTF-8 excerpt or "not_included"
     response_schema     : {"schema_version": str, "full_schema_sha256": str}
     """
+    source_sha256: str
     provider_id: str
     requested_model_id: str
     adapter_version: str
@@ -195,13 +213,22 @@ class SceneVisionSemanticRequest:
     transcript_context: dict
     response_schema: dict
 
+    def __post_init__(self) -> None:
+        if not _is_valid_sha256(self.source_sha256):
+            raise ValueError(
+                f"source_sha256 must be exactly 64 lowercase hexadecimal characters; "
+                f"got {len(self.source_sha256)!r} characters"
+            )
+
     def to_canonical_identity_dict(self) -> dict:
         """Return a deterministic, JSON-serializable dict for cache hashing.
 
         The returned dict contains only primitive types (str, int, float, bool,
         None, list, dict). It is safe to pass to json.dumps(sort_keys=True).
+        source_sha256 is always lowercased for canonical normalization.
         """
         return {
+            "source_sha256": self.source_sha256.lower(),
             "provider_id": self.provider_id,
             "requested_model_id": self.requested_model_id,
             "adapter_version": self.adapter_version,
@@ -228,15 +255,140 @@ class SceneVisionSemanticRequest:
         return hashlib.sha256(canonical).hexdigest()
 
 
-@dataclass
+@dataclass(frozen=True)
 class ProviderContentBundle:
     """Non-serializable in-memory content payload for provider construction.
 
     NOT part of cache identity. MUST be built from verified semantic request
-    fields. The image_bytes list is in the same order as semantic_request.images.
+    fields. The image_bytes tuple is in the same order as semantic_request.images.
     transcript_excerpt is the raw UTF-8 text if mode=="included", else None.
 
+    IMMUTABLE: frozen dataclass with tuple[bytes, ...] (not list).
     This object is never serialized, logged, or stored in cache.
     """
-    image_bytes: list[bytes]         # raw JPEG bytes; order matches semantic_request.images
+    image_bytes: tuple[bytes, ...]   # raw JPEG bytes; order matches semantic_request.images
     transcript_excerpt: str | None   # raw UTF-8 text or None if not included
+
+
+# ── Content bundle validation ─────────────────────────────────────────────────
+
+def _read_jpeg_dimensions(data: bytes) -> tuple[int, int] | None:
+    """Parse JPEG SOF markers to extract (width, height). Returns None on failure."""
+    try:
+        if len(data) < 4 or data[:2] != b'\xff\xd8':
+            return None
+        i = 2
+        while i < len(data) - 8:
+            if data[i] != 0xFF:
+                return None
+            marker = data[i + 1]
+            if marker in (0xC0, 0xC1, 0xC2):  # SOF0, SOF1, SOF2
+                height = (data[i + 5] << 8) | data[i + 6]
+                width = (data[i + 7] << 8) | data[i + 8]
+                return (width, height)
+            if marker in (0xD8, 0xD9):
+                return None
+            segment_len = (data[i + 2] << 8) | data[i + 3]
+            i += 2 + segment_len
+        return None
+    except (IndexError, TypeError):
+        return None
+
+
+def validate_content_bundle_against_semantic_request(
+    semantic_request: SceneVisionSemanticRequest,
+    content_bundle: ProviderContentBundle,
+) -> None:
+    """Validate that content_bundle matches semantic_request exactly.
+
+    Verifies ALL of the following (raises ProviderContentIntegrityError on any):
+    1. Image count matches descriptor count.
+    2. Each image SHA-256 matches its descriptor.
+    3. Each image MIME magic matches its descriptor.
+    4. Each image JPEG dimensions match its descriptor (where parseable).
+    5. Frame order/ID preserved (order == index in sequence).
+    6. Transcript consent mode and hash consistency.
+    7. Character count matches when transcript is included.
+
+    Does NOT disclose raw bytes or transcript text in exception messages.
+    This function is called at Point A (before cache lookup) and
+    Point B (before provider invocation on cache miss).
+    """
+    descriptors = semantic_request.images
+    bundle_bytes = content_bundle.image_bytes
+
+    # 1. Count check
+    if len(bundle_bytes) != len(descriptors):
+        raise ProviderContentIntegrityError(
+            f"Image count mismatch: semantic descriptor has {len(descriptors)} image(s), "
+            f"content bundle has {len(bundle_bytes)} image(s)"
+        )
+
+    for idx, (desc, raw) in enumerate(zip(descriptors, bundle_bytes)):
+        # 5. Order/frame_id check (descriptor.order must equal position index)
+        if desc.get("order") != idx:
+            raise ProviderContentIntegrityError(
+                f"Frame order mismatch at bundle position {idx}: "
+                f"descriptor order={desc.get('order')!r}"
+            )
+
+        # 2. SHA-256 check
+        actual_sha = hashlib.sha256(raw).hexdigest()
+        expected_sha = desc.get("full_sha256", "")
+        if actual_sha.lower() != expected_sha.lower():
+            raise ProviderContentIntegrityError(
+                f"Image SHA-256 mismatch at index {idx} "
+                f"(order={desc.get('order')}, frame_id={desc.get('frame_id')!r}): "
+                f"expected suffix ...{expected_sha[-12:]}, got ...{actual_sha[-12:]}"
+            )
+
+        # 3. MIME magic check
+        mime = desc.get("mime_type", "")
+        is_jpeg = len(raw) >= 2 and raw[:2] == b'\xff\xd8'
+        if mime == "image/jpeg" and not is_jpeg:
+            raise ProviderContentIntegrityError(
+                f"MIME mismatch at index {idx}: descriptor declares image/jpeg "
+                f"but bytes do not start with JPEG magic (FF D8)"
+            )
+
+        # 4. JPEG dimension check (only when parseable and mime is JPEG)
+        if mime == "image/jpeg" and is_jpeg:
+            dims = _read_jpeg_dimensions(raw)
+            if dims is not None:
+                exp_w = desc.get("width", -1)
+                exp_h = desc.get("height", -1)
+                if dims[0] != exp_w or dims[1] != exp_h:
+                    raise ProviderContentIntegrityError(
+                        f"JPEG dimension mismatch at index {idx}: "
+                        f"descriptor says {exp_w}x{exp_h}, parsed {dims[0]}x{dims[1]}"
+                    )
+
+    # 6 & 7. Transcript consent and hash verification
+    tc = semantic_request.transcript_context
+    mode = tc.get("mode", "not_included")
+    excerpt = content_bundle.transcript_excerpt
+
+    if mode == "included":
+        if excerpt is None:
+            raise ProviderContentIntegrityError(
+                "Transcript mode is 'included' but bundle.transcript_excerpt is None"
+            )
+        actual_sha = hashlib.sha256(excerpt.encode("utf-8")).hexdigest()
+        expected_sha = tc.get("content_sha256", "")
+        if actual_sha.lower() != expected_sha.lower():
+            raise ProviderContentIntegrityError(
+                "Transcript content hash mismatch between bundle and semantic descriptor"
+            )
+        expected_count = tc.get("character_count", -1)
+        actual_count = len(excerpt.encode("utf-8"))
+        if actual_count != expected_count:
+            raise ProviderContentIntegrityError(
+                f"Transcript UTF-8 byte count mismatch: "
+                f"descriptor says {expected_count}, bundle is {actual_count}"
+            )
+    else:
+        # not_included or redacted: excerpt MUST be None
+        if excerpt is not None:
+            raise ProviderContentIntegrityError(
+                f"Transcript mode is '{mode}' but bundle.transcript_excerpt is not None"
+            )

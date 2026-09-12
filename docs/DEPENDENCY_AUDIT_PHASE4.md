@@ -18,7 +18,13 @@
 
 | Package | Version | Classification | Import style | Declared |
 |---|---|---|---|---|
-| `openai` | 3.8.0 | OPTIONAL_RUNTIME | Lazy (only in `openai_backend.py`) | `pyproject.toml [vision-openai]` |
+| `openai` | 3.13.0 | OPTIONAL_RUNTIME | Lazy (only in `openai_backend.py`) | `pyproject.toml [vision-openai]` |
+
+**Verification (Correction 3, 2026-09-11):** Version `3.13.0` confirmed published on PyPI via
+`pip index versions openai`. Previous declaration `openai==3.8.0` was replaced with the
+verified installed version `3.13.0`. The adapter uses `openai.OpenAI()` and
+`client.chat.completions.create()` (Chat Completions API, not Responses API).
+No migration away from Chat Completions is required in this correction.
 
 Install with: `pip install "auto-video-editor[vision-openai]"`. Only required when using `--provider openai`.
 

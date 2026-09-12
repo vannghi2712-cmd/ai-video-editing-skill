@@ -1,4 +1,4 @@
-﻿# Architecture Audit â€” ai-video-editing-skill
+# Architecture Audit â€” ai-video-editing-skill
 
 > **Audit Date:** 2026-09-02T13:36:44+07:00
 > **Auditor:** Phase 1 Automated Agent
@@ -422,9 +422,51 @@ Phase 4 (Vision API, scene scoring, edit planning, FFmpeg rendering, CapCut, vid
 Cloudflare deployment) is **NOT implemented**.
 Explicit user authorization is required before Phase 4 begins.
 
-## Phase 4 (Scene Analysis) — Contract Notes
+## Phase 4 (Scene Analysis) — Contract Notes (updated Correction 3, 2026-09-11)
 
-- Cache v2.0.0: two-level identity. Level A = source + tools + detector. Level B = Level A + keyframe SHAs + profile + provider + model + schema + transcript context + upload consent.
-- Scoring: `weighted_score` requires 100% coverage. Partial results use `partial_weighted_score` + `score_coverage_percent`.
-- Output ownership: `--force` cannot override source SHA mismatch.
+### Cache and Identity
+
+- Cache schema v4.0.0: two-level identity.
+  - Level A = source SHA-256 + ffmpeg/ffprobe versions + detector config + extractor config.
+  - Level B = Level A + all per-scene `SceneVisionSemanticRequest` canonical dicts (includes `source_sha256`, keyframe SHAs, profile hash, provider, model, prompt hash, schema hash, transcript consent/hash).
+- `SceneVisionSemanticRequest` is a **frozen dataclass** with `source_sha256` as a direct field.
+  - Validated to exactly 64 hexadecimal characters.
+  - Normalized to lowercase in canonical identity.
+- `ProviderContentBundle` is a **frozen dataclass** with `image_bytes: tuple[bytes, ...]`.
+  - Never serialized. Not part of cache identity.
+
+### Content Integrity
+
+- `validate_content_bundle_against_semantic_request()` verifies image SHA-256, MIME magic, JPEG dimensions, frame order, transcript consent, transcript hash, and transcript character count.
+- Mismatches raise `ProviderContentIntegrityError(ValueError)`. Error messages do not contain raw bytes or transcript plaintext.
+- **Point A** validation: before cache lookup.
+- **Point B** validation: before provider invocation (cache miss only).
+- Keyframe SHA mismatch: fail-closed (`EXIT_CONTENT_INTEGRITY_ERROR = 9`). SHA comparison is case-insensitive.
+
+### Atomic I/O
+
+- All managed artifacts use `atomic_io.py`: `mkstemp → write → flush → fsync → os.replace → re-read → verify SHA`.
+- `WriterLock` (O_CREAT|O_EXCL) prevents concurrent cache writers.
+- Cache publication order: `clip_analysis.json` FIRST, then `manifest.json` LAST.
+- `manifest.json` contains `clip_analysis_sha256`.
+- `cache.get()` verifies artifact SHA before returning. Wrong SHA → safe miss.
+
+### Ownership and Path Safety
+
+- Symlinks and Windows reparse points rejected via `lstat()` **before** `resolve()`.
+- `--force` does NOT bypass symlink rejection, source SHA mismatch, or legacy v1 detection.
+- Root marker written atomically. Never rotated on rerun.
+- Legacy v1 output (`schema_version == "1.0.0"`) rejected before any mutation.
+
+### Scoring
+
+- `weighted_score` requires 100% dimension coverage. Partial results use `partial_weighted_score` + `score_coverage_percent`.
+- Output schema version: `2.0.0`. Cache schema version: `4.0.0`. Vision adapter: `1.3.0`.
+
+### Provider Status
+
+- `LIVE_VISION_STATUS: NOT_RUN`
+- `VISION_PROVIDER_RUNTIME_CONTRACT: UNVERIFIED`
+- OpenAI optional dependency: `openai==3.13.0` (verified PyPI, 2026-09-11).
+- Chat Completions is the current implementation. No Responses API migration required.
 - Phase 5: LOCKED. Website: NOT IMPLEMENTED.
