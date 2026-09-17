@@ -347,7 +347,7 @@ See [docs/TRANSCRIPTION_GUIDE.md](docs/TRANSCRIPTION_GUIDE.md) for full document
 ## Phase 4 — Scene Analysis & Vision Scoring
 
 > **Status: IMPLEMENTED (mock pipeline). Live OpenAI Vision: NOT_RUN.**
-> Cache schema: 4.0.0 · Output schema: 2.0.0 · Vision adapter: 1.3.0
+> Cache schema: 4.1.0 · Output schema: 2.0.0 · Vision adapter: 1.4.0
 > Phase 5: LOCKED.
 
 Analyze a video with the mock backend:

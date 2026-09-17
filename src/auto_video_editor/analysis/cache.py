@@ -1,16 +1,22 @@
 """Content-addressed two-level cache for Phase 4 scene analysis.
 
-Cache Format Version: 4.0.0
-Vision Adapter Version: 1.3.0
+Cache Format Version: 4.1.0
+Vision Adapter Version: 1.4.0
 
 Level A — Preprocessing Cache Identity:
   source_sha256, ffmpeg_version, ffprobe_version,
   scene_detector_config, extractor_config (slots, max_dim).
 
-Level B — Semantic Request Job Identity:
-  SHA-256 of sorted canonical JSON of all per-scene SceneVisionSemanticRequest
-  canonical identity dicts, combined with preprocessing_sha256 and
-  cache_schema_version. Each scene request now includes source_sha256.
+Level B — Strict Canonical Job Envelope (no external preprocessing_sha256):
+  Hashed over a single JSON envelope:
+    {
+      "cache_schema_version": "4.1.0",
+      "request_count": <int>,
+      "semantic_requests": [<ordered canonical request dicts>]
+    }
+  Each canonical dict includes preprocessing_identity_sha256 directly, so
+  the Level-A identity is embedded inside the Level-B hash — no separate
+  preprocessing_sha256 parameter is accepted or needed.
 
 Provider cache MUST NOT be queried with unverified/placeholder data.
 Old cache entries (version != CACHE_SCHEMA_VERSION) are safe misses.
@@ -21,19 +27,26 @@ Atomic write contract (enforced via atomic_io module):
   1. Temp file in same directory as destination.
   2. Unique temp name via mkstemp.
   3. Write + flush + fsync (best-effort on Windows).
-  4. os.replace(temp, destination).
-  5. Re-read and verify SHA-256.
+  4. Pre-replace TOCTOU check (symlink/reparse on parent + destination).
+  5. os.replace(temp, destination).
+  6. Re-read and verify SHA-256.
 
 Publication order:
   clip_analysis.json is written BEFORE manifest.json.
   A manifest without a valid clip_analysis.json is never published.
 
 Writer exclusion:
-  WriterLock (exclusive O_CREAT|O_EXCL lock file) prevents concurrent
+  WriterLock (exclusive O_CREAT|O_EXCL, random UUID token) prevents concurrent
   writers from publishing to the same cache entry simultaneously.
+  Release is token-verified: only the owning process can delete the lock.
+  Stale locks are only removed when the owning PID is provably dead.
 
 Cache hit validation:
-  get() verifies artifact SHA-256 from manifest before returning cached data.
+  get() verifies artifact SHA-256 from manifest, strictly parses JSON,
+  checks schema_version == "2.0.0", and runs full Draft 2020-12 JSON Schema
+  validation before returning cached data.
+  A missing schema file or jsonschema package is a configuration failure
+  (CacheSchemaValidationError), not a silent cache miss.
 """
 from __future__ import annotations
 
@@ -47,10 +60,17 @@ from auto_video_editor.analysis.atomic_io import (
     WriterLockError,
     atomic_write_text,
 )
+from auto_video_editor.analysis.models import CacheSchemaValidationError
 
-# Bumped: 3.0.0 → 4.0.0 (SceneVisionSemanticRequest canonical identity + source_sha256)
-CACHE_SCHEMA_VERSION = "4.0.0"
-VISION_ADAPTER_VERSION = "1.3.0"
+# Bumped: 4.0.0 → 4.1.0 (preprocessing_identity_sha256 in canonical request;
+# strict job-ID envelope; explicit raw-content binding; output transaction lock)
+CACHE_SCHEMA_VERSION = "4.1.0"
+VISION_ADAPTER_VERSION = "1.4.0"
+
+# Path to the public clip_analysis JSON Schema (Draft 2020-12)
+_SCHEMA_PATH = (
+    Path(__file__).parent.parent.parent.parent / "schemas" / "clip_analysis.schema.json"
+)
 
 
 def _sha256_of(text: str) -> str:
@@ -91,25 +111,63 @@ def preprocessing_job_id(
 
 def semantic_request_job_id(
     *,
-    preprocessing_sha256: str,
     scene_canonical_dicts: list[dict],
 ) -> str:
-    """Level-B identity: aggregated SHA of all per-scene semantic request dicts.
+    """Level-B identity: strict JSON envelope over all per-scene semantic requests.
 
-    scene_canonical_dicts must be ordered by scene_id ascending.
-    Each dict is produced by SceneVisionSemanticRequest.to_canonical_identity_dict()
-    and now includes source_sha256 as a top-level field.
-    preprocessing_sha256 is the Level-A identity (preprocessing_job_id result).
+    Each canonical dict (from SceneVisionSemanticRequest.to_canonical_identity_dict())
+    already contains preprocessing_identity_sha256, source_sha256, and all other
+    semantic fields. No external preprocessing_sha256 argument is accepted.
+
+    The envelope format is:
+    {
+      "cache_schema_version": "4.1.0",
+      "request_count": <int>,
+      "semantic_requests": [<ordered canonical dicts>]
+    }
 
     Provider cache MUST NOT be queried before all semantic requests are built
     and all keyframe bytes are verified.
     """
-    aggregated = {
+    envelope = {
         "cache_schema_version": CACHE_SCHEMA_VERSION,
-        "preprocessing_sha256": preprocessing_sha256,
-        "scene_requests": scene_canonical_dicts,
+        "request_count": len(scene_canonical_dicts),
+        "semantic_requests": scene_canonical_dicts,
     }
-    return _sha256_of(_canonical_json(aggregated))
+    return _sha256_of(_canonical_json(envelope))
+
+
+def _validate_cached_analysis_strict(analysis: dict) -> None:
+    """Full Draft 2020-12 validation of cached analysis.
+
+    Raises CacheSchemaValidationError (not returns None) when:
+    - The schema file is missing (configuration failure).
+    - The jsonschema package is not installed (configuration failure).
+    - The analysis fails schema validation.
+
+    This function is called on every cache hit before the cached data is
+    returned or written to the public output directory.
+    """
+    if not _SCHEMA_PATH.exists():
+        raise CacheSchemaValidationError(
+            f"clip_analysis.schema.json not found at {_SCHEMA_PATH!s}. "
+            "This is a configuration failure; the pipeline cannot validate a cache hit."
+        )
+    try:
+        from jsonschema import Draft202012Validator  # noqa: PLC0415
+    except ImportError as exc:
+        raise CacheSchemaValidationError(
+            "jsonschema package is required for cache-hit schema validation "
+            "but is not installed. This is a configuration failure."
+        ) from exc
+
+    schema = json.loads(_SCHEMA_PATH.read_text(encoding="utf-8"))
+    errors = list(Draft202012Validator(schema).iter_errors(analysis))
+    if errors:
+        msgs = [str(e.message) for e in errors[:3]]
+        raise CacheSchemaValidationError(
+            f"Cached analysis fails Draft 2020-12 schema validation: {'; '.join(msgs)}"
+        )
 
 
 class AnalysisCache:
@@ -172,10 +230,13 @@ class AnalysisCache:
         2. manifest.cache_schema_version must match CACHE_SCHEMA_VERSION.
         3. manifest.job_id must match the requested job_id.
         4. clip_analysis artifact SHA-256 must match manifest.clip_analysis_sha256.
-        5. analysis JSON must parse and have schema_version != "1.0.0".
+        5. analysis JSON must strict-parse and have schema_version != "1.0.0".
         6. Output schema version must be "2.0.0".
+        7. Full Draft 2020-12 JSON Schema validation (CacheSchemaValidationError on failure).
 
-        Any failure → safe miss (return None).
+        Any failure in steps 1–6 → safe miss (return None).
+        Step 7 failure → raises CacheSchemaValidationError (configuration failure,
+        not a silent miss — the caller must not accept an unvalidated cache hit).
         """
         entry = self._entry_dir(job_id)
         manifest_path = entry / "manifest.json"
@@ -205,7 +266,13 @@ class AnalysisCache:
                 return None
             if analysis.get("schema_version") != "2.0.0":
                 return None
+
+            # Step 7: Full Draft 2020-12 schema validation — configuration failure on error
+            _validate_cached_analysis_strict(analysis)
+
             return {"job_id": job_id, "analysis": analysis, "manifest": manifest}
+        except CacheSchemaValidationError:
+            raise  # Propagate — this is a configuration failure, not a safe miss
         except Exception:  # noqa: BLE001
             return None
 
@@ -215,7 +282,7 @@ class AnalysisCache:
         """Store analysis JSON atomically under job_id.
 
         Publication order:
-        1. Acquire exclusive WriterLock.
+        1. Acquire exclusive WriterLock (random UUID token, token-verified release).
         2. Create/validate entry directory.
         3. Atomic write clip_analysis.json (with post-replace SHA verification).
         4. Compute clip_analysis SHA-256.

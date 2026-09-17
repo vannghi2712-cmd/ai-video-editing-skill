@@ -15,9 +15,20 @@ Cache order (ENFORCED):
   12. Point B: validate_content_bundle_against_semantic_request() per scene (cache miss only)
   13. Provider invocation (cache miss only)
 
-Symlink/reparse protection:
-  Raw output path is checked via is_symlink() and Windows reparse attribute
-  BEFORE resolve() is ever called. Symlinks and reparse points are rejected.
+Path safety (all checks before resolve()):
+  1. check_path_ancestors(out_dir): all existing ancestors must be real directories.
+  2. _is_symlink_or_reparse(out_dir): final component check.
+  3. Same checks applied to cache root directory before use.
+  4. Pre-replace TOCTOU recheck inside atomic_write_bytes() (every artifact).
+  5. Ownership recheck after lock acquisition (inside output WriterLock).
+
+Output transaction:
+  WriterLock on out_dir wraps BOTH clip_analysis.json AND manifest.json writes.
+  Cache-hit publication also acquires the same lock and writes manifest.json.
+  Two concurrent processes cannot produce a mixed artifact/manifest pair.
+
+Cache transaction:
+  WriterLock on cache entry directory (in cache.put()).
 
 Legacy v1 protection:
   If clip_analysis.json already exists with schema_version=="1.0.0", the
@@ -36,10 +47,12 @@ from pathlib import Path
 
 from auto_video_editor.analysis.atomic_io import (
     ArtifactIntegrityError,
+    PathSafetyError,
     WriterLock,
     WriterLockError,
     atomic_write_bytes,
     atomic_write_text,
+    check_path_ancestors,
 )
 from auto_video_editor.analysis.cache import (
     CACHE_SCHEMA_VERSION,
@@ -53,15 +66,17 @@ from auto_video_editor.analysis.exporters import export_clip_analysis, validate_
 from auto_video_editor.analysis.keyframe_extractor import extract_keyframes
 from auto_video_editor.analysis.media_inspector import inspect_media
 from auto_video_editor.analysis.models import (
+    CacheSchemaValidationError,
     ClipAnalysis,
     LegacyOutputSchemaError,
     ProviderContentBundle,
     ProviderContentIntegrityError,
+    ProviderImageContent,
     SceneVisionSemanticRequest,
     validate_content_bundle_against_semantic_request,
 )
 from auto_video_editor.analysis.scene_detector import detect_scenes
-from auto_video_editor.analysis.scoring.base import PROMPT_VERSION, VISION_ADAPTER_VERSION as _ADAPTER_VER
+from auto_video_editor.analysis.scoring.base import PROMPT_VERSION
 from auto_video_editor.analysis.transcript_associator import (
     associate_transcript,
     load_transcript,
@@ -168,13 +183,32 @@ def _is_symlink_or_reparse(path: Path) -> bool:
     return False
 
 
-def _check_ownership(out_dir: Path, source_sha256: str, force: bool) -> tuple[bool, str]:
-    # ── Raw-path symlink/reparse check FIRST (before resolve) ──────────────
-    if out_dir.exists() and _is_symlink_or_reparse(out_dir):
+def _check_path_safety(path: Path, label: str) -> tuple[bool, str]:
+    """Check ancestors AND final component for symlink/reparse.
+
+    Returns (ok, error_message). ok=True means path is safe.
+    """
+    # 1. Check all existing ancestors
+    try:
+        check_path_ancestors(path)
+    except PathSafetyError as exc:
         return False, (
-            "Output dir is a symlink or Windows reparse point. "
-            "Use a real directory as --output-dir."
+            f"{label} has a symlink or reparse point at an ancestor component: {exc}"
         )
+    # 2. Check the final component itself
+    if path.exists() and _is_symlink_or_reparse(path):
+        return False, (
+            f"{label} is a symlink or Windows reparse point. "
+            "Use a real directory."
+        )
+    return True, ""
+
+
+def _check_ownership(out_dir: Path, source_sha256: str, force: bool) -> tuple[bool, str]:
+    # ── Ancestor + raw-path symlink/reparse check FIRST (before resolve) ──────
+    ok, err = _check_path_safety(out_dir, "Output dir")
+    if not ok:
+        return False, err
 
     if not out_dir.exists():
         return True, ""
@@ -278,23 +312,32 @@ def _build_semantic_request(
     schema_sha: str,
     ctx_text: str | None,
     source_sha256: str,
+    preprocessing_identity_sha256: str,
 ) -> tuple[SceneVisionSemanticRequest, ProviderContentBundle]:
     """Build one immutable SceneVisionSemanticRequest and its ProviderContentBundle."""
 
     # Image descriptors — SHAs from actual bytes (already verified)
     images = []
+    pic_records: list[ProviderImageContent] = []
     for order, (kf, b) in enumerate(zip(ok_kf, image_bytes_tuple)):
         w, h = _jpeg_dimensions(b)
         sha = hashlib.sha256(b).hexdigest()
+        frame_id = f"scene_{scene.index:04d}_slot_{kf.slot}"
         images.append({
             "order": order,
-            "frame_id": f"scene_{scene.index:04d}_slot_{kf.slot}",
+            "frame_id": frame_id,
             "full_sha256": sha,
             "mime_type": "image/jpeg",
             "width": w,
             "height": h,
             "detail": "auto",
         })
+        # Explicit immutable binding: ProviderImageContent ties order+frame_id+bytes
+        pic_records.append(ProviderImageContent(
+            order=order,
+            frame_id=frame_id,
+            image_bytes=b,
+        ))
 
     # Transcript context
     if ctx_text is not None and config.include_transcript_context:
@@ -314,9 +357,10 @@ def _build_semantic_request(
 
     semantic_req = SceneVisionSemanticRequest(
         source_sha256=source_sha256.lower(),
+        preprocessing_identity_sha256=preprocessing_identity_sha256.lower(),
         provider_id=config.provider,
         requested_model_id=config.vision_model or "",
-        adapter_version=_ADAPTER_VER,
+        adapter_version=VISION_ADAPTER_VERSION,
         prompt={"version": PROMPT_VERSION, "content_sha256": _PROMPT_TEMPLATE_SHA},
         provider_options={
             "detail": "auto",
@@ -346,7 +390,7 @@ def _build_semantic_request(
     )
 
     bundle = ProviderContentBundle(
-        image_bytes=image_bytes_tuple,
+        images=tuple(pic_records),
         transcript_excerpt=ctx_text if ctx_mode == "included" else None,
     )
 
@@ -366,6 +410,7 @@ class AnalysisService:
         t_start = time.monotonic()
         warnings: list[str] = []
         out_dir = Path(config.output_dir)
+        cache_root = Path(config.cache_dir)
 
         # ── Consent checks ────────────────────────────────────────────────────
         if config.provider == "openai" and not config.allow_external_upload:
@@ -404,8 +449,17 @@ class AnalysisService:
             )
             return EXIT_SUCCESS, "Dry-run complete"
 
-        # ── Output directory: raw-path checks before resolve ──────────────────
+        # ── Path safety: output dir (ancestors + final component) ─────────────
         out_dir.mkdir(parents=True, exist_ok=True)
+        ok_path, err_path = _check_path_safety(out_dir, "Output dir")
+        if not ok_path:
+            return EXIT_SCHEMA_OUTPUT_ERROR, err_path
+
+        # ── Path safety: cache root ───────────────────────────────────────────
+        cache_root.mkdir(parents=True, exist_ok=True)
+        ok_cache_path, err_cache_path = _check_path_safety(cache_root, "Cache root")
+        if not ok_cache_path:
+            return EXIT_SCHEMA_OUTPUT_ERROR, err_cache_path
 
         # ── Ownership check (includes symlink/reparse rejection) ──────────────
         ok, err_msg = _check_ownership(out_dir, media_info.sha256, config.force)
@@ -532,6 +586,7 @@ class AnalysisService:
                 scene, verified_kf, tuple(image_bytes_list),
                 profile, profile_hash, config, schema_sha, ctx_text,
                 source_sha256=source_sha256_lower,
+                preprocessing_identity_sha256=pre_id,
             )
             semantic_requests.append(sem_req)
             content_bundles.append(bundle)
@@ -549,18 +604,61 @@ class AnalysisService:
         # ── Step 9-10: Aggregate canonical identity → job SHA ─────────────────
         scene_canonical_dicts = [req.to_canonical_identity_dict() for req in semantic_requests]
         job_id = semantic_request_job_id(
-            preprocessing_sha256=pre_id,
             scene_canonical_dicts=scene_canonical_dicts,
         )
 
         # ── Step 11: Provider cache lookup (ONLY after Point A) ───────────────
         cache = AnalysisCache(config.cache_dir)
         if config.resume and not config.force:
-            cached = cache.get(job_id)
+            try:
+                cached = cache.get(job_id)
+            except CacheSchemaValidationError as exc:
+                return EXIT_SCHEMA_OUTPUT_ERROR, (
+                    f"Cache hit failed full schema validation (configuration failure): {exc}"
+                )
             if cached:
                 print("Cache hit (OK) -- restoring from cache")
-                analysis_json = json.dumps(cached["analysis"], indent=2, ensure_ascii=False)
-                atomic_write_text(out_dir / "clip_analysis.json", analysis_json)
+                analysis_json_c = json.dumps(cached["analysis"], indent=2, ensure_ascii=False)
+                analysis_bytes_c = analysis_json_c.encode("utf-8")
+                analysis_sha_c = hashlib.sha256(analysis_bytes_c).hexdigest()
+                root_id_c = _read_root_marker(out_dir) or marker_id
+                manifest_c = {
+                    "manifest_version": _MANIFEST_VERSION,
+                    "owner": _OWNER_TAG,
+                    "output_root_id": root_id_c,
+                    "root_binding_sha256": _root_binding_sha256(out_dir),
+                    "source_sha256": media_info.sha256,
+                    "profile_id": config.profile_id,
+                    "analysis_schema_version": _ANALYSIS_SCHEMA_VERSION,
+                    "cache_schema_version": CACHE_SCHEMA_VERSION,
+                    "clip_analysis_sha256": analysis_sha_c,
+                    "generated_artifacts": [
+                        "clip_analysis.json", "manifest.json", _ROOT_MARKER_FILENAME,
+                    ],
+                    "restored_from_cache": True,
+                }
+                manifest_text_c = json.dumps(manifest_c, indent=2)
+                try:
+                    with WriterLock(out_dir, timeout=10.0):
+                        # Recheck path safety after acquiring lock (TOCTOU prevention)
+                        if _is_symlink_or_reparse(out_dir):
+                            return EXIT_SCHEMA_OUTPUT_ERROR, (
+                                "Output dir became a symlink after lock acquisition."
+                            )
+                        atomic_write_bytes(
+                            out_dir / "clip_analysis.json",
+                            analysis_bytes_c,
+                            expected_sha256=analysis_sha_c,
+                        )
+                        atomic_write_text(manifest_path, manifest_text_c)
+                except WriterLockError as exc:
+                    return EXIT_SCHEMA_OUTPUT_ERROR, (
+                        f"Cannot acquire output root writer lock (cache restore): {exc}"
+                    )
+                except ArtifactIntegrityError as exc:
+                    return EXIT_SCHEMA_OUTPUT_ERROR, (
+                        f"Artifact integrity error during cache restore: {exc}"
+                    )
                 return EXIT_SUCCESS, "Analysis restored from cache"
 
         # ── Step 12: Point B — Validate bundles again BEFORE provider ────────
@@ -627,19 +725,9 @@ class AnalysisService:
             if schema_errors:
                 return EXIT_SCHEMA_OUTPUT_ERROR, f"Schema validation failed: {'; '.join(schema_errors[:3])}"
 
-        # ── Atomic write clip_analysis.json ───────────────────────────────────
+        # ── Atomic output transaction (WriterLock on out_dir) ─────────────────
         analysis_bytes = analysis_json.encode("utf-8")
         analysis_sha = hashlib.sha256(analysis_bytes).hexdigest()
-        try:
-            atomic_write_bytes(
-                out_dir / "clip_analysis.json",
-                analysis_bytes,
-                expected_sha256=analysis_sha,
-            )
-        except ArtifactIntegrityError as exc:
-            return EXIT_SCHEMA_OUTPUT_ERROR, f"Artifact integrity error writing clip_analysis.json: {exc}"
-
-        # ── Atomic write manifest.json (LAST) ─────────────────────────────────
         root_id = _read_root_marker(out_dir) or marker_id
         manifest = {
             "manifest_version": _MANIFEST_VERSION,
@@ -656,10 +744,36 @@ class AnalysisService:
             ],
         }
         manifest_text = json.dumps(manifest, indent=2)
+
         try:
-            atomic_write_text(manifest_path, manifest_text)
-        except ArtifactIntegrityError as exc:
-            return EXIT_SCHEMA_OUTPUT_ERROR, f"Artifact integrity error writing manifest.json: {exc}"
+            with WriterLock(out_dir, timeout=10.0):
+                # Recheck path safety after acquiring lock (TOCTOU prevention)
+                if _is_symlink_or_reparse(out_dir):
+                    return EXIT_SCHEMA_OUTPUT_ERROR, (
+                        "Output dir became a symlink after lock acquisition."
+                    )
+                # Atomic write clip_analysis.json FIRST
+                try:
+                    atomic_write_bytes(
+                        out_dir / "clip_analysis.json",
+                        analysis_bytes,
+                        expected_sha256=analysis_sha,
+                    )
+                except ArtifactIntegrityError as exc:
+                    return EXIT_SCHEMA_OUTPUT_ERROR, (
+                        f"Artifact integrity error writing clip_analysis.json: {exc}"
+                    )
+                # Atomic write manifest.json LAST
+                try:
+                    atomic_write_text(manifest_path, manifest_text)
+                except ArtifactIntegrityError as exc:
+                    return EXIT_SCHEMA_OUTPUT_ERROR, (
+                        f"Artifact integrity error writing manifest.json: {exc}"
+                    )
+        except WriterLockError as exc:
+            return EXIT_SCHEMA_OUTPUT_ERROR, (
+                f"Cannot acquire output root writer lock: {exc}"
+            )
 
         # ── Cache store ───────────────────────────────────────────────────────
         cache.put(

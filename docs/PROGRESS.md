@@ -422,3 +422,71 @@ Harden all Phase 4 Final Contract elements identified in the read-only acceptanc
 - `VISION_PROVIDER_RUNTIME_CONTRACT: UNVERIFIED`
 - Phase 5: LOCKED
 - Pending: final read-only SHA verification before Phase 4 is accepted
+
+---
+
+## Phase 4 — Targeted Contract Correction 4 (2026-09-17)
+
+### Objective
+Fix 7 defects found in Phase 4 Final Read-Only Acceptance Audit 2 (commit `a83f1f71`):
+CONTENT_BINDING_AMBIGUOUS, PROVIDER_SEMANTIC_DIVERGENCE, VERSION_INVALIDATION,
+OUTPUT_TRANSACTION_UNLOCKED, LOCK_LIFECYCLE_UNSAFE, PATH_ANCESTOR_OR_TOCTOU_GAP,
+CACHE_HIT_SCHEMA_VALIDATION_MISSING.
+
+### Corrections Applied
+
+**Fix 1 — CONTENT_BINDING_AMBIGUOUS (models.py)**
+- New `ProviderImageContent(order: int, frame_id: str, image_bytes: bytes)` frozen dataclass.
+- New `ProviderContentBundle(images: tuple[ProviderImageContent, ...], ...)` — replaces `image_bytes: tuple[bytes, ...]`.
+- `validate_content_bundle_against_semantic_request()` rewrote: builds `dict[(order, frame_id), ProviderImageContent]` lookup; rejects non-canonical order, duplicate pairs, empty frame_id, or unmatched frame_id.
+- No positional zip allowed. Explicit (order, frame_id) → bytes mapping enforced.
+
+**Fix 2 — PROVIDER_SEMANTIC_DIVERGENCE (models.py, cache.py, service.py)**
+- `preprocessing_identity_sha256: str` added as second field of `SceneVisionSemanticRequest`.
+- Validated to exactly 64 hex chars; normalized to lowercase in `to_canonical_identity_dict()`.
+- `semantic_request_job_id()` drops `preprocessing_sha256` parameter. Hashes strict JSON envelope:
+  `{"cache_schema_version": "4.1.0", "request_count": N, "semantic_requests": [...]}`.
+- `preprocessing_identity_sha256` is embedded in each canonical dict (NOT the envelope).
+
+**Fix 3 — VERSION_INVALIDATION (cache.py)**
+- `CACHE_SCHEMA_VERSION = "4.1.0"` (was `"4.0.0"`).
+- `VISION_ADAPTER_VERSION = "1.4.0"` (was `"1.3.0"`).
+- `service.py` now imports `VISION_ADAPTER_VERSION` from `cache.py` (not `scoring/base.py`).
+- `scoring/base.py` unchanged (outside allowlist; its `VISION_ADAPTER_VERSION = "1.3.0"` is its internal constant).
+
+**Fix 4 — OUTPUT_TRANSACTION_UNLOCKED (service.py)**
+- `WriterLock(out_dir)` now wraps BOTH `clip_analysis.json` AND `manifest.json` writes on the normal path.
+- Cache-hit path now also acquires `WriterLock(out_dir)` and writes `manifest.json` (was missing).
+- Post-lock TOCTOU recheck: `_is_symlink_or_reparse(out_dir)` inside the lock context.
+
+**Fix 5 — LOCK_LIFECYCLE_UNSAFE (atomic_io.py)**
+- `WriterLock.__init__`: `self._token = str(uuid.uuid4())` — random per-instance UUID.
+- `_acquire()` writes `f"{self._token}:{os.getpid()}"` to lock file.
+- `_try_remove_dead_lock()`: parses `token:pid`, calls `os.kill(pid, 0)` — only removes if `ProcessLookupError` (provably dead); `PermissionError`/`OSError` → leave lock.
+- `_release()`: reads file; only deletes if `content.startswith(f"{self._token}:")` — never deletes foreign-token lock.
+
+**Fix 6 — PATH_ANCESTOR_OR_TOCTOU_GAP (atomic_io.py, service.py)**
+- `PathSafetyError(OSError)` new exception.
+- `check_path_ancestors(path)` checks every existing ancestor component for symlink/reparse via `lstat()`.
+- `atomic_write_bytes()` rechecks destination for symlink/reparse before `os.replace()`.
+- `service.py` calls `_check_path_safety(out_dir)` and `_check_path_safety(cache_root)` before pipeline start.
+
+**Fix 7 — CACHE_HIT_SCHEMA_VALIDATION_MISSING (cache.py, models.py)**
+- `CacheSchemaValidationError(ValueError)` new exception in `models.py`.
+- `_validate_cached_analysis_strict(analysis: dict)`: raises `CacheSchemaValidationError` if schema file missing, jsonschema not installed, or Draft 2020-12 validation fails.
+- `AnalysisCache.get()` calls `_validate_cached_analysis_strict()` at step 7 (before returning).
+- `CacheSchemaValidationError` propagates to caller (NOT converted to safe miss).
+- `service.py` catches `CacheSchemaValidationError` from `cache.get()` and returns `EXIT_SCHEMA_OUTPUT_ERROR`.
+
+### Tests
+- **421 tests PASS, EXIT=0** (base env, 403 + 18 new)
+- Skipped: 2 (symlink tests require admin on Windows)
+- New: `TestCorrection4Contracts` (18 tests covering all 7 contracts)
+- Updated: `_make_semantic_request()`, `TestAnalysisCache._job_id()`, `TestBundleIntegrity`, `TestCacheVersionBump`, `TestClosureCorrections.test_vision_adapter_version`, existing semantic job ID tests
+
+### Status
+- `LIVE_VISION_STATUS: NOT_RUN`
+- `VISION_PROVIDER_RUNTIME_CONTRACT: UNVERIFIED`
+- Phase 5: LOCKED
+- Correction 4 commit pending final SHA verification
+

@@ -422,17 +422,21 @@ Phase 4 (Vision API, scene scoring, edit planning, FFmpeg rendering, CapCut, vid
 Cloudflare deployment) is **NOT implemented**.
 Explicit user authorization is required before Phase 4 begins.
 
-## Phase 4 (Scene Analysis) — Contract Notes (updated Correction 3, 2026-09-11)
+## Phase 4 (Scene Analysis) — Contract Notes (updated Correction 4, 2026-09-17)
 
 ### Cache and Identity
 
-- Cache schema v4.0.0: two-level identity.
+- Cache schema v4.1.0: two-level identity.
   - Level A = source SHA-256 + ffmpeg/ffprobe versions + detector config + extractor config.
-  - Level B = Level A + all per-scene `SceneVisionSemanticRequest` canonical dicts (includes `source_sha256`, keyframe SHAs, profile hash, provider, model, prompt hash, schema hash, transcript consent/hash).
-- `SceneVisionSemanticRequest` is a **frozen dataclass** with `source_sha256` as a direct field.
-  - Validated to exactly 64 hexadecimal characters.
-  - Normalized to lowercase in canonical identity.
-- `ProviderContentBundle` is a **frozen dataclass** with `image_bytes: tuple[bytes, ...]`.
+  - Level B = SHA-256 of Canonical JSON Envelope:
+    `{"cache_schema_version": "4.1.0", "request_count": N, "semantic_requests": [...]}`.
+    Each per-scene dict includes `preprocessing_identity_sha256` directly (NOT a separate envelope field).
+- `SceneVisionSemanticRequest` is a **frozen dataclass** with `source_sha256` and `preprocessing_identity_sha256` as direct fields.
+  - Both validated to exactly 64 hexadecimal characters, normalized to lowercase in canonical identity.
+- `ProviderImageContent(order: int, frame_id: str, image_bytes: bytes)` — **frozen dataclass**, immutable binding.
+- `ProviderContentBundle(images: tuple[ProviderImageContent, ...], transcript_excerpt: str | None)` — **frozen dataclass**.
+  - No positional zip. Every image looked up by exact `(order, frame_id)` pair.
+  - Non-canonical order, duplicate pairs, or wrong `frame_id` → `ProviderContentIntegrityError`.
   - Never serialized. Not part of cache identity.
 
 ### Content Integrity
@@ -446,13 +450,22 @@ Explicit user authorization is required before Phase 4 begins.
 ### Atomic I/O
 
 - All managed artifacts use `atomic_io.py`: `mkstemp → write → flush → fsync → os.replace → re-read → verify SHA`.
-- `WriterLock` (O_CREAT|O_EXCL) prevents concurrent cache writers.
+- `WriterLock` uses random UUID ownership tokens; lock file contains `token:pid`.
+  - Release only deletes if token matches. Never deletes foreign-token locks.
+  - Stale lock removal: only if owning PID is provably dead (`ProcessLookupError`); `PermissionError` → leave lock.
+- Output root `WriterLock` wraps BOTH `clip_analysis.json` AND `manifest.json` writes atomically.
+- Cache-hit publication also acquires the output `WriterLock` and writes `manifest.json`.
 - Cache publication order: `clip_analysis.json` FIRST, then `manifest.json` LAST.
 - `manifest.json` contains `clip_analysis_sha256`.
-- `cache.get()` verifies artifact SHA before returning. Wrong SHA → safe miss.
+- `cache.get()` validates against full Draft 2020-12 schema BEFORE returning.
+  - Schema validation failure → `CacheSchemaValidationError(ValueError)` (NOT a silent miss).
+  - Wrong SHA → safe miss. Old schema v1.0.0 → safe miss.
 
-### Ownership and Path Safety
+### Path Safety
 
+- `check_path_ancestors(path)` validates every existing ancestor component for symlinks/reparse points before lock creation.
+- `atomic_write_bytes()` rechecks destination for symlink/reparse immediately before `os.replace()` (TOCTOU prevention).
+- Output dir and cache root path safety checked before pipeline start AND after lock acquisition.
 - Symlinks and Windows reparse points rejected via `lstat()` **before** `resolve()`.
 - `--force` does NOT bypass symlink rejection, source SHA mismatch, or legacy v1 detection.
 - Root marker written atomically. Never rotated on rerun.
@@ -461,7 +474,7 @@ Explicit user authorization is required before Phase 4 begins.
 ### Scoring
 
 - `weighted_score` requires 100% dimension coverage. Partial results use `partial_weighted_score` + `score_coverage_percent`.
-- Output schema version: `2.0.0`. Cache schema version: `4.0.0`. Vision adapter: `1.3.0`.
+- Output schema version: `2.0.0`. Cache schema version: `4.1.0`. Vision adapter: `1.4.0`.
 
 ### Provider Status
 
@@ -470,3 +483,4 @@ Explicit user authorization is required before Phase 4 begins.
 - OpenAI optional dependency: `openai==3.13.0` (verified PyPI, 2026-09-11).
 - Chat Completions is the current implementation. No Responses API migration required.
 - Phase 5: LOCKED. Website: NOT IMPLEMENTED.
+

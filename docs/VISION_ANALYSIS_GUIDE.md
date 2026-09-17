@@ -103,20 +103,35 @@ Without these flags, the pipeline exits with code 6 (consent error) before any u
 - Legacy v1 output (`schema_version == "1.0.0"`) → rejected even with `--force`.
 - `--force` can only overwrite artifacts declared by a valid, same-source, non-symlink, non-v1 manifest.
 
-## Cache (v4.0.0)
+## Cache (v4.1.0)
 
-Two-level content-addressed cache (schema version 4.0.0):
+Two-level content-addressed cache (schema version 4.1.0):
 - **Level A (Preprocessing):** source SHA + tool versions + detector/extractor config.
-- **Level B (Provider):** Level A + ordered per-scene `SceneVisionSemanticRequest` canonical dicts
-  (each includes `source_sha256`, keyframe SHAs, profile hash, provider, model, prompt hash, schema hash, transcript consent/hash).
+- **Level B (Provider):** Canonical JSON Envelope hashed over all per-scene
+  `SceneVisionSemanticRequest` dicts. Each dict now includes `preprocessing_identity_sha256`
+  directly (embedded, not a separate envelope field). Envelope format:
+  `{"cache_schema_version": "4.1.0", "request_count": N, "semantic_requests": [...]}`.
+
+Content binding (Correction 4):
+- `ProviderImageContent(order, frame_id, image_bytes)` — immutable frozen record.
+- `ProviderContentBundle(images=tuple[ProviderImageContent, ...])` — no positional zip.
+- Every bundle image is looked up by exact `(order, frame_id)` pair; non-canonical order, duplicate pairs, or mismatched frame_id → `ProviderContentIntegrityError`.
 
 Atomic write contract:
 - `clip_analysis.json` written FIRST, `manifest.json` LAST.
-- Manifest contains `clip_analysis_sha256`; `cache.get()` verifies before returning.
+- Both writes occur inside a `WriterLock` on the public output root (UUID-token verified).
+- Cache-hit publication also acquires the `WriterLock` and writes `manifest.json`.
+- Manifest contains `clip_analysis_sha256`; `cache.get()` validates against full Draft 2020-12 schema before returning.
+- Schema validation failure → `CacheSchemaValidationError` (not a silent cache miss).
 - Wrong SHA → safe miss. Old schema (v1.0.0) → rejection.
-- `WriterLock` (O_CREAT|O_EXCL) prevents concurrent writers.
+- `WriterLock` uses random UUID ownership tokens; stale locks only removed when PID is provably dead; never deletes a foreign-token lock.
 
-Old caches (v≠4.0.0) are safely ignored (version mismatch = cache miss).
+Path safety (Correction 4):
+- `check_path_ancestors(path)` validates every existing ancestor component for symlinks/reparse points.
+- Atomic writes recheck destination for symlink/reparse immediately before `os.replace()`.
+- Output dir and cache root path safety checked before pipeline start and after lock acquisition.
+
+Old caches (v≠4.1.0) are safely ignored (version mismatch = cache miss).
 
 ## Live Vision (NOT RUN)
 

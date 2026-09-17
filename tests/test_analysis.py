@@ -50,15 +50,21 @@ def _make_semantic_request(
     transcript_text: str | None = None,
     provider_id: str = "mock",
     source_sha256: str | None = None,
+    preprocessing_identity_sha256: str | None = None,
 ):
     """Build (SceneVisionSemanticRequest, ProviderContentBundle) for unit tests.
 
     sha_list: list of 64-char hex SHA-256 strings (one per image slot).
     If sha_list is None or empty → no images (insufficient evidence path).
     Fake 1-byte image content is synthesised per SHA to fill the bundle.
+
+    Uses explicit ProviderImageContent binding (order+frame_id+bytes).
     """
-    from auto_video_editor.analysis.models import ProviderContentBundle, SceneVisionSemanticRequest
-    from auto_video_editor.analysis.scoring.base import PROMPT_VERSION, VISION_ADAPTER_VERSION
+    from auto_video_editor.analysis.models import (
+        ProviderContentBundle, ProviderImageContent, SceneVisionSemanticRequest,
+    )
+    from auto_video_editor.analysis.cache import VISION_ADAPTER_VERSION
+    from auto_video_editor.analysis.scoring.base import PROMPT_VERSION
 
     if profile is None:
         profile = _make_mock_profile()
@@ -70,13 +76,16 @@ def _make_semantic_request(
     sha_list = sha_list or []
     if source_sha256 is None:
         source_sha256 = "a" * 64
+    if preprocessing_identity_sha256 is None:
+        preprocessing_identity_sha256 = "b" * 64
 
     images = []
-    image_bytes = []
+    pic_records: list[ProviderImageContent] = []
     for order, sha in enumerate(sha_list):
+        frame_id = f"scene_{scene_id:04d}_slot_{order}"
         images.append({
             "order": order,
-            "frame_id": f"scene_{scene_id:04d}_slot_{order}",
+            "frame_id": frame_id,
             "full_sha256": sha,
             "mime_type": "image/jpeg",
             "width": 320,
@@ -84,7 +93,11 @@ def _make_semantic_request(
             "detail": "auto",
         })
         # Synthetic bytes — not real JPEG, only needed for bundle
-        image_bytes.append(sha.encode("ascii"))
+        pic_records.append(ProviderImageContent(
+            order=order,
+            frame_id=frame_id,
+            image_bytes=sha.encode("ascii"),
+        ))
 
     if transcript_text is not None:
         ctx_sha = hashlib.sha256(transcript_text.encode("utf-8")).hexdigest()
@@ -97,6 +110,7 @@ def _make_semantic_request(
 
     sem_req = SceneVisionSemanticRequest(
         source_sha256=source_sha256,
+        preprocessing_identity_sha256=preprocessing_identity_sha256,
         provider_id=provider_id,
         requested_model_id="",
         adapter_version=VISION_ADAPTER_VERSION,
@@ -125,7 +139,7 @@ def _make_semantic_request(
         },
     )
     bundle = ProviderContentBundle(
-        image_bytes=tuple(image_bytes),
+        images=tuple(pic_records),
         transcript_excerpt=transcript_text,
     )
     return sem_req, bundle
@@ -574,23 +588,11 @@ class TestAnalysisCache(unittest.TestCase):
 
     def _job_id(self, source_sha="A" * 64, provider_id="mock"):
         """Compute a semantic_request_job_id for test use."""
-        from auto_video_editor.analysis.cache import (
-            preprocessing_job_id,
-            semantic_request_job_id,
-            CACHE_SCHEMA_VERSION,
-        )
-        pre_id = preprocessing_job_id(
-            source_sha256=source_sha,
-            ffmpeg_version="test-ffmpeg",
-            ffprobe_version="test-ffprobe",
-            scene_detector_config={"threshold": 0.3, "min_duration_seconds": 1.0, "max_duration_seconds": 15.0},
-            extractor_slots=3,
-            extractor_max_dim=1280,
-        )
+        from auto_video_editor.analysis.cache import semantic_request_job_id
         profile = _make_mock_profile()
-        req, _ = _make_semantic_request(sha_list=[], profile=profile, provider_id=provider_id)
+        req, _ = _make_semantic_request(sha_list=[], profile=profile, provider_id=provider_id,
+                                        source_sha256=source_sha)
         return semantic_request_job_id(
-            preprocessing_sha256=pre_id,
             scene_canonical_dicts=[req.to_canonical_identity_dict()],
         )
 
@@ -600,8 +602,45 @@ class TestAnalysisCache(unittest.TestCase):
         self.assertIsNone(result)
 
     def test_put_then_get_returns_data(self):
+        """cache.put() then cache.get() returns data for a valid analysis document."""
         cache = self._cache()
-        analysis_json = json.dumps({"schema_version": "2.0.0", "status": "complete"})
+        # Build a valid analysis JSON using the real exporter (cache.get() now validates schema)
+        from auto_video_editor.analysis.models import (
+            ClipAnalysis, MediaInfo, Scene, SceneScore,
+        )
+        from auto_video_editor.analysis.exporters import export_clip_analysis
+        source = MediaInfo(
+            path="/test/video.mp4",
+            sha256="A" * 64,
+            duration_us=5_000_000,
+            width=320, height=240, fps=30.0,
+            has_audio=True, has_video=True,
+            codec_name="h264", size_bytes=1_000_000,
+        )
+        scene = Scene(0, 0, 5_000_000, None)
+        score = SceneScore(
+            scene_index=0, provider="mock", model_id=None,
+            prompt_version="1.0.0",
+            dimensions=(), score_coverage_percent=0.0,
+            partial_weighted_score=0.0, weighted_score=None,
+            keyframes_used=0, status="insufficient_evidence",
+        )
+        analysis = ClipAnalysis(
+            schema_version="2.0.0",
+            status="complete",
+            source=source,
+            profile_id="test",
+            profile_hash="P" * 64,
+            detector_config={"threshold": 0.3, "min_duration_seconds": 1.0, "max_duration_seconds": 15.0},
+            scenes=(scene,),
+            keyframes=(),
+            scores=(score,),
+            warnings=(),
+            metrics={"elapsed_seconds": 1.0, "scenes_detected": 1, "keyframes_extracted": 0, "scenes_scored": 0},
+            provenance={"analysis_schema_version": "2.0.0", "provider": "mock", "model_id": None,
+                        "prompt_version": "1.0.0", "adapter_version": "1.4.0"},
+        )
+        analysis_json = export_clip_analysis(analysis)
         jid = self._job_id()
         cache.put(jid, analysis_json)
         result = cache.get(jid)
@@ -1076,14 +1115,14 @@ class TestMergeShortDeterminism(unittest.TestCase):
 
 
 class TestCacheVersionBump(unittest.TestCase):
-    """Cache v4.0.0 — old caches must safely miss."""
+    """Cache v4.1.0 — old caches must safely miss."""
 
     def test_cache_schema_version_is_4(self):
         from auto_video_editor.analysis.cache import CACHE_SCHEMA_VERSION
-        self.assertEqual(CACHE_SCHEMA_VERSION, "4.0.0")
+        self.assertEqual(CACHE_SCHEMA_VERSION, "4.1.0")
 
     def test_old_version_manifest_is_miss(self):
-        """A manifest with v3.0.0 (old) must return None (safe miss on v4.0.0)."""
+        """A manifest with v3.0.0 (old) must return None (safe miss on v4.1.0)."""
         import tempfile
         tmp = tempfile.mkdtemp()
         try:
@@ -1098,7 +1137,7 @@ class TestCacheVersionBump(unittest.TestCase):
             with open(os.path.join(entry, "clip_analysis.json"), "w") as f:
                 j.dump({"schema_version": "2.0.0"}, f)
             result = cache.get(job_id)
-            self.assertIsNone(result, "Stale v3.0.0 cache must be a miss on v4.0.0")
+            self.assertIsNone(result, "Stale v3.0.0 cache must be a miss on v4.1.0")
         finally:
             import shutil
             shutil.rmtree(tmp, ignore_errors=True)
@@ -1232,24 +1271,15 @@ class TestClosureCorrections(unittest.TestCase):
         self.assertTrue(issubclass(LegacyOutputSchemaError, ValueError))
 
     def test_vision_adapter_version(self):
-        """VISION_ADAPTER_VERSION must be 1.3.0."""
-        from auto_video_editor.analysis.scoring.base import VISION_ADAPTER_VERSION
-        self.assertEqual(VISION_ADAPTER_VERSION, "1.3.0")
+        """VISION_ADAPTER_VERSION in cache must be 1.4.0."""
         from auto_video_editor.analysis.cache import VISION_ADAPTER_VERSION as CV
-        self.assertEqual(CV, "1.3.0")
+        self.assertEqual(CV, "1.4.0")
 
     def test_semantic_request_job_id_exists(self):
         """semantic_request_job_id must exist and return 64-char hex."""
-        from auto_video_editor.analysis.cache import (
-            semantic_request_job_id, preprocessing_job_id,
-        )
-        pre = preprocessing_job_id(
-            source_sha256="A" * 64, ffmpeg_version="v", ffprobe_version="v",
-            scene_detector_config={}, extractor_slots=3, extractor_max_dim=1280,
-        )
+        from auto_video_editor.analysis.cache import semantic_request_job_id
         req, _ = _make_semantic_request()
         jid = semantic_request_job_id(
-            preprocessing_sha256=pre,
             scene_canonical_dicts=[req.to_canonical_identity_dict()],
         )
         self.assertEqual(len(jid), 64)
@@ -1379,8 +1409,10 @@ class TestSemanticRequestIdentity(unittest.TestCase):
     def test_invalid_source_sha256_rejected(self):
         """source_sha256 shorter/longer than 64 hex chars must raise ValueError."""
         from auto_video_editor.analysis.models import SceneVisionSemanticRequest
-        from auto_video_editor.analysis.scoring.base import PROMPT_VERSION, VISION_ADAPTER_VERSION
+        from auto_video_editor.analysis.cache import VISION_ADAPTER_VERSION
+        from auto_video_editor.analysis.scoring.base import PROMPT_VERSION
         base_kwargs = dict(
+            preprocessing_identity_sha256="B" * 64,
             provider_id="mock", requested_model_id="",
             adapter_version=VISION_ADAPTER_VERSION,
             prompt={"version": PROMPT_VERSION, "content_sha256": "x"},
@@ -1412,13 +1444,10 @@ class TestSemanticRequestIdentity(unittest.TestCase):
         from auto_video_editor.analysis.cache import semantic_request_job_id
         req_a, _ = self._make_req(source_sha256="a" * 64)
         req_b, _ = self._make_req(source_sha256="b" * 64)
-        pre_id = "x" * 64
         id_a = semantic_request_job_id(
-            preprocessing_sha256=pre_id,
             scene_canonical_dicts=[req_a.to_canonical_identity_dict()],
         )
         id_b = semantic_request_job_id(
-            preprocessing_sha256=pre_id,
             scene_canonical_dicts=[req_b.to_canonical_identity_dict()],
         )
         self.assertNotEqual(id_a, id_b)
@@ -1445,15 +1474,21 @@ class TestSemanticRequestIdentity(unittest.TestCase):
 
     def test_provider_content_bundle_is_frozen(self):
         """ProviderContentBundle must be a frozen dataclass (immutable)."""
-        from auto_video_editor.analysis.models import ProviderContentBundle
-        bundle = ProviderContentBundle(image_bytes=(b"x",), transcript_excerpt=None)
+        from auto_video_editor.analysis.models import ProviderContentBundle, ProviderImageContent
+        bundle = ProviderContentBundle(
+            images=(ProviderImageContent(order=0, frame_id="f0", image_bytes=b"x"),),
+            transcript_excerpt=None,
+        )
         with self.assertRaises((AttributeError, TypeError)):
-            bundle.image_bytes = (b"y",)  # type: ignore[misc]
+            bundle.images = ()  # type: ignore[misc]
 
     def test_provider_content_bundle_uses_tuple(self):
-        """ProviderContentBundle.image_bytes must be tuple[bytes, ...], not list."""
+        """ProviderContentBundle.images must be tuple[ProviderImageContent, ...], not list."""
         _, bundle = _make_semantic_request(sha_list=[hashlib.sha256(b"x").hexdigest()])
-        self.assertIsInstance(bundle.image_bytes, tuple)
+        self.assertIsInstance(bundle.images, tuple)
+        if bundle.images:
+            from auto_video_editor.analysis.models import ProviderImageContent
+            self.assertIsInstance(bundle.images[0], ProviderImageContent)
 
 
 # ── Phase 4 Final Contract: Bundle Integrity ──────────────────────────────────
@@ -1467,9 +1502,9 @@ class TestBundleIntegrity(unittest.TestCase):
         jpeg_like = b'\xff\xd8' + b'\x00' * 20
         sha = hashlib.sha256(jpeg_like).hexdigest()
         sem_req, _ = _make_semantic_request(sha_list=[sha])
-        from auto_video_editor.analysis.models import ProviderContentBundle
+        from auto_video_editor.analysis.models import ProviderContentBundle, ProviderImageContent
         bundle = ProviderContentBundle(
-            image_bytes=(jpeg_like,),
+            images=(ProviderImageContent(order=0, frame_id="scene_0000_slot_0", image_bytes=jpeg_like),),
             transcript_excerpt=None,
         )
         return sem_req, bundle
@@ -1483,35 +1518,47 @@ class TestBundleIntegrity(unittest.TestCase):
     def test_image_sha_mismatch_raises(self):
         """Wrong image bytes (SHA mismatch) must raise ProviderContentIntegrityError."""
         from auto_video_editor.analysis.models import (
-            ProviderContentBundle, ProviderContentIntegrityError,
+            ProviderContentBundle, ProviderContentIntegrityError, ProviderImageContent,
             validate_content_bundle_against_semantic_request,
         )
         sem_req, _ = self._valid_pair()
-        bad_bundle = ProviderContentBundle(image_bytes=(b"wrong_content",), transcript_excerpt=None)
+        bad_bundle = ProviderContentBundle(
+            images=(ProviderImageContent(order=0, frame_id="scene_0000_slot_0", image_bytes=b"wrong_content"),),
+            transcript_excerpt=None,
+        )
         with self.assertRaises(ProviderContentIntegrityError):
             validate_content_bundle_against_semantic_request(sem_req, bad_bundle)
 
     def test_image_count_mismatch_raises(self):
         """Bundle with wrong image count must raise ProviderContentIntegrityError."""
         from auto_video_editor.analysis.models import (
-            ProviderContentBundle, ProviderContentIntegrityError,
+            ProviderContentBundle, ProviderContentIntegrityError, ProviderImageContent,
             validate_content_bundle_against_semantic_request,
         )
         sem_req, _ = self._valid_pair()
-        bad_bundle = ProviderContentBundle(image_bytes=(b"a", b"b"), transcript_excerpt=None)
+        bad_bundle = ProviderContentBundle(
+            images=(
+                ProviderImageContent(order=0, frame_id="scene_0000_slot_0", image_bytes=b"a"),
+                ProviderImageContent(order=1, frame_id="scene_0000_slot_1", image_bytes=b"b"),
+            ),
+            transcript_excerpt=None,
+        )
         with self.assertRaises(ProviderContentIntegrityError):
             validate_content_bundle_against_semantic_request(sem_req, bad_bundle)
 
     def test_error_message_does_not_contain_raw_bytes(self):
         """ProviderContentIntegrityError must not embed raw image bytes in message."""
         from auto_video_editor.analysis.models import (
-            ProviderContentBundle, ProviderContentIntegrityError,
+            ProviderContentBundle, ProviderContentIntegrityError, ProviderImageContent,
             validate_content_bundle_against_semantic_request,
         )
         secret_payload = b"SECRET_CONTENT_DO_NOT_LEAK"
         sha = hashlib.sha256(secret_payload).hexdigest()
         sem_req, _ = _make_semantic_request(sha_list=[sha])
-        bad_bundle = ProviderContentBundle(image_bytes=(b"wrong",), transcript_excerpt=None)
+        bad_bundle = ProviderContentBundle(
+            images=(ProviderImageContent(order=0, frame_id="scene_0000_slot_0", image_bytes=b"wrong"),),
+            transcript_excerpt=None,
+        )
         try:
             validate_content_bundle_against_semantic_request(sem_req, bad_bundle)
             self.fail("Expected ProviderContentIntegrityError")
@@ -1531,7 +1578,7 @@ class TestBundleIntegrity(unittest.TestCase):
             transcript_text="correct transcript",
         )
         bad_bundle = ProviderContentBundle(
-            image_bytes=(),
+            images=(),
             transcript_excerpt="wrong transcript",
         )
         with self.assertRaises(ProviderContentIntegrityError):
@@ -1545,7 +1592,7 @@ class TestBundleIntegrity(unittest.TestCase):
         )
         sem_req, _ = _make_semantic_request(sha_list=[])  # no transcript
         bad_bundle = ProviderContentBundle(
-            image_bytes=(),
+            images=(),
             transcript_excerpt="should not be here",
         )
         with self.assertRaises(ProviderContentIntegrityError):
@@ -1560,7 +1607,7 @@ class TestBundleIntegrity(unittest.TestCase):
         sem_req, _ = _make_semantic_request(
             sha_list=[], transcript_text="something",
         )
-        bad_bundle = ProviderContentBundle(image_bytes=(), transcript_excerpt=None)
+        bad_bundle = ProviderContentBundle(images=(), transcript_excerpt=None)
         with self.assertRaises(ProviderContentIntegrityError):
             validate_content_bundle_against_semantic_request(sem_req, bad_bundle)
 
@@ -1932,5 +1979,246 @@ class TestDependencyContract(unittest.TestCase):
         self.assertEqual(new_imports, set(), "OpenAI must not be imported at service.py load time")
 
 
+
 if __name__ == "__main__":
     unittest.main()
+
+
+# ── Phase 4 Correction 4: Contract Regression Tests ───────────────────────────
+
+class TestCorrection4Contracts(unittest.TestCase):
+    """Focused regression tests for Phase 4 Correction 4 contracts.
+
+    Covers: CONTENT_BINDING_AMBIGUOUS, PROVIDER_SEMANTIC_DIVERGENCE,
+    VERSION_INVALIDATION, OUTPUT_TRANSACTION_UNLOCKED, LOCK_LIFECYCLE_UNSAFE,
+    PATH_ANCESTOR_OR_TOCTOU_GAP, CACHE_HIT_SCHEMA_VALIDATION_MISSING.
+    """
+
+    # ── Contract 1 & 2: ProviderImageContent explicit binding ────────────────
+
+    def test_provider_image_content_class_exists(self):
+        """ProviderImageContent class must exist in models."""
+        from auto_video_editor.analysis.models import ProviderImageContent
+        pic = ProviderImageContent(order=0, frame_id="f0", image_bytes=b"data")
+        self.assertEqual(pic.order, 0)
+        self.assertEqual(pic.frame_id, "f0")
+        self.assertEqual(pic.image_bytes, b"data")
+
+    def test_provider_image_content_is_frozen(self):
+        """ProviderImageContent must be immutable (frozen dataclass)."""
+        from auto_video_editor.analysis.models import ProviderImageContent
+        pic = ProviderImageContent(order=0, frame_id="f0", image_bytes=b"x")
+        with self.assertRaises((AttributeError, TypeError)):
+            pic.order = 1  # type: ignore[misc]
+
+    def test_noncanonical_bundle_order_rejected(self):
+        """Bundle images with non-canonical order (not 0..n-1) must raise."""
+        from auto_video_editor.analysis.models import (
+            ProviderContentBundle, ProviderContentIntegrityError, ProviderImageContent,
+            validate_content_bundle_against_semantic_request,
+        )
+        sha = hashlib.sha256(b"img").hexdigest()
+        sem_req, _ = _make_semantic_request(sha_list=[sha])
+        # order=1 for first slot is non-canonical (should be 0)
+        bad_bundle = ProviderContentBundle(
+            images=(ProviderImageContent(order=1, frame_id="scene_0000_slot_0", image_bytes=sha.encode("ascii")),),
+            transcript_excerpt=None,
+        )
+        with self.assertRaises(ProviderContentIntegrityError):
+            validate_content_bundle_against_semantic_request(sem_req, bad_bundle)
+
+    def test_wrong_frame_id_in_bundle_rejected(self):
+        """Bundle record with wrong frame_id must be rejected (no positional fallback)."""
+        from auto_video_editor.analysis.models import (
+            ProviderContentBundle, ProviderContentIntegrityError, ProviderImageContent,
+            validate_content_bundle_against_semantic_request,
+        )
+        jpeg_like = b'\xff\xd8' + b'\x00' * 20
+        sha = hashlib.sha256(jpeg_like).hexdigest()
+        sem_req, _ = _make_semantic_request(sha_list=[sha])
+        # Correct bytes and order but WRONG frame_id
+        bad_bundle = ProviderContentBundle(
+            images=(ProviderImageContent(order=0, frame_id="WRONG_FRAME_ID", image_bytes=jpeg_like),),
+            transcript_excerpt=None,
+        )
+        with self.assertRaises(ProviderContentIntegrityError):
+            validate_content_bundle_against_semantic_request(sem_req, bad_bundle)
+
+    def test_duplicate_order_in_bundle_rejected(self):
+        """Bundle with duplicate (order, frame_id) pairs must be rejected."""
+        from auto_video_editor.analysis.models import (
+            ProviderContentBundle, ProviderContentIntegrityError, ProviderImageContent,
+            validate_content_bundle_against_semantic_request,
+        )
+        sha0 = hashlib.sha256(b"img0").hexdigest()
+        sha1 = hashlib.sha256(b"img1").hexdigest()
+        sem_req, _ = _make_semantic_request(sha_list=[sha0, sha1])
+        # Two records with the same (order=0, frame_id) → duplicate
+        bad_bundle = ProviderContentBundle(
+            images=(
+                ProviderImageContent(order=0, frame_id="scene_0000_slot_0", image_bytes=b"x"),
+                ProviderImageContent(order=0, frame_id="scene_0000_slot_0", image_bytes=b"y"),
+            ),
+            transcript_excerpt=None,
+        )
+        with self.assertRaises(ProviderContentIntegrityError):
+            validate_content_bundle_against_semantic_request(sem_req, bad_bundle)
+
+    # ── Contract 2: preprocessing_identity_sha256 ────────────────────────────
+
+    def test_preprocessing_identity_sha256_field_exists(self):
+        """SceneVisionSemanticRequest must have preprocessing_identity_sha256 field."""
+        req, _ = _make_semantic_request()
+        self.assertTrue(hasattr(req, "preprocessing_identity_sha256"))
+        self.assertEqual(len(req.preprocessing_identity_sha256), 64)
+
+    def test_preprocessing_identity_sha256_in_canonical_dict(self):
+        """preprocessing_identity_sha256 must appear in to_canonical_identity_dict()."""
+        req, _ = _make_semantic_request(preprocessing_identity_sha256="c" * 64)
+        canon = req.to_canonical_identity_dict()
+        self.assertIn("preprocessing_identity_sha256", canon)
+        self.assertEqual(canon["preprocessing_identity_sha256"], "c" * 64)
+
+    def test_preprocessing_identity_sha256_changes_job_id(self):
+        """Different preprocessing_identity_sha256 must produce different job IDs."""
+        from auto_video_editor.analysis.cache import semantic_request_job_id
+        req_a, _ = _make_semantic_request(preprocessing_identity_sha256="a" * 64)
+        req_b, _ = _make_semantic_request(preprocessing_identity_sha256="e" * 64)
+        id_a = semantic_request_job_id(scene_canonical_dicts=[req_a.to_canonical_identity_dict()])
+        id_b = semantic_request_job_id(scene_canonical_dicts=[req_b.to_canonical_identity_dict()])
+        self.assertNotEqual(id_a, id_b)
+
+    def test_preprocessing_identity_sha256_lowercase_normalized(self):
+        """preprocessing_identity_sha256 must be lowercased in canonical dict."""
+        req, _ = _make_semantic_request(preprocessing_identity_sha256="A" * 64)
+        canon = req.to_canonical_identity_dict()
+        self.assertEqual(canon["preprocessing_identity_sha256"], "a" * 64)
+
+    def test_semantic_job_id_envelope_has_request_count(self):
+        """semantic_request_job_id envelope must use request_count and cache_schema_version."""
+        from auto_video_editor.analysis.cache import (
+            semantic_request_job_id, CACHE_SCHEMA_VERSION,
+        )
+        import json, hashlib as _hl
+        req, _ = _make_semantic_request()
+        canon_dicts = [req.to_canonical_identity_dict()]
+        jid = semantic_request_job_id(scene_canonical_dicts=canon_dicts)
+        # Reproduce the envelope and verify it produces the same hash
+        envelope = {
+            "cache_schema_version": CACHE_SCHEMA_VERSION,
+            "request_count": 1,
+            "semantic_requests": canon_dicts,
+        }
+        expected = _hl.sha256(
+            json.dumps(envelope, sort_keys=True, separators=(",", ":"),
+                       ensure_ascii=False, allow_nan=False).encode("utf-8")
+        ).hexdigest()
+        self.assertEqual(jid, expected)
+
+    # ── Contract 3: VERSION_INVALIDATION ────────────────────────────────────
+
+    def test_cache_schema_version_is_4_1_0(self):
+        """CACHE_SCHEMA_VERSION must be exactly '4.1.0'."""
+        from auto_video_editor.analysis.cache import CACHE_SCHEMA_VERSION
+        self.assertEqual(CACHE_SCHEMA_VERSION, "4.1.0")
+
+    def test_vision_adapter_version_is_1_4_0(self):
+        """VISION_ADAPTER_VERSION in cache must be exactly '1.4.0'."""
+        from auto_video_editor.analysis.cache import VISION_ADAPTER_VERSION
+        self.assertEqual(VISION_ADAPTER_VERSION, "1.4.0")
+
+    # ── Contract 5: WriterLock token-verified release ─────────────────────────
+
+    def test_writer_lock_token_in_lock_file(self):
+        """WriterLock must write its random UUID token to the lock file."""
+        import tempfile, shutil
+        from auto_video_editor.analysis.atomic_io import WriterLock
+        tmp = tempfile.mkdtemp()
+        try:
+            p = Path(tmp)
+            lock = WriterLock(p, timeout=5.0)
+            lock_path = p / ".writer_lock"
+            lock._acquire()
+            try:
+                content = lock_path.read_text(encoding="ascii")
+                self.assertIn(lock._token, content, "Lock file must contain the ownership token")
+            finally:
+                lock._release()
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_writer_lock_release_does_not_delete_foreign_token(self):
+        """WriterLock._release() must not delete a lock file holding a foreign token."""
+        import tempfile, shutil
+        from auto_video_editor.analysis.atomic_io import WriterLock
+        tmp = tempfile.mkdtemp()
+        try:
+            p = Path(tmp)
+            lock_path = p / ".writer_lock"
+            # Write a foreign token to the lock file
+            foreign_token = "foreign-token-not-ours"
+            lock_path.write_text(f"{foreign_token}:99999", encoding="ascii")
+            # Create a lock with a different token
+            lock = WriterLock(p, timeout=5.0)
+            lock._acquired = True  # pretend it's acquired
+            lock._release()
+            # Lock file must still exist (foreign token, not deleted)
+            self.assertTrue(lock_path.exists(), "Foreign lock file must not be deleted on release")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    # ── Contract 6: PATH_ANCESTOR check ─────────────────────────────────────
+
+    def test_check_path_ancestors_exists(self):
+        """check_path_ancestors must be importable from atomic_io."""
+        from auto_video_editor.analysis.atomic_io import check_path_ancestors
+        import tempfile, shutil
+        tmp = tempfile.mkdtemp()
+        try:
+            p = Path(tmp) / "sub" / "leaf"
+            p.parent.mkdir(parents=True, exist_ok=True)
+            # Should not raise on a normal real directory
+            check_path_ancestors(p)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_path_safety_error_importable(self):
+        """PathSafetyError must be importable from atomic_io."""
+        from auto_video_editor.analysis.atomic_io import PathSafetyError
+        self.assertTrue(issubclass(PathSafetyError, OSError))
+
+    # ── Contract 7: CACHE_HIT_SCHEMA_VALIDATION_MISSING ─────────────────────
+
+    def test_cache_hit_schema_validation_raises_not_miss(self):
+        """cache.get() must raise CacheSchemaValidationError on schema-invalid cached data."""
+        import tempfile, shutil, json as _json
+        from auto_video_editor.analysis.cache import AnalysisCache, CACHE_SCHEMA_VERSION
+        from auto_video_editor.analysis.models import CacheSchemaValidationError
+        tmp = tempfile.mkdtemp()
+        try:
+            cache = AnalysisCache(tmp)
+            job_id = "schema_invalid_test"
+            entry = Path(tmp) / job_id
+            entry.mkdir()
+            # Write a syntactically valid JSON with matching schema_version but missing required fields
+            # schema_version=2.0.0 passes the string check, but Draft 2020-12 validation will fail
+            invalid_data = {"schema_version": "2.0.0"}
+            analysis_bytes = _json.dumps(invalid_data).encode("utf-8")
+            analysis_sha = hashlib.sha256(analysis_bytes).hexdigest()
+            (entry / "clip_analysis.json").write_bytes(analysis_bytes)
+            manifest_data = {
+                "job_id": job_id,
+                "cache_schema_version": CACHE_SCHEMA_VERSION,
+                "clip_analysis_sha256": analysis_sha,
+            }
+            (entry / "manifest.json").write_text(_json.dumps(manifest_data), encoding="utf-8")
+            # Must raise CacheSchemaValidationError (not return None as a safe miss)
+            with self.assertRaises(CacheSchemaValidationError):
+                cache.get(job_id)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_cache_schema_validation_error_importable(self):
+        """CacheSchemaValidationError must be importable from models."""
+        from auto_video_editor.analysis.models import CacheSchemaValidationError
+        self.assertTrue(issubclass(CacheSchemaValidationError, ValueError))

@@ -8,7 +8,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 
@@ -28,6 +28,14 @@ class ProviderContentIntegrityError(ValueError):
     This is a content-integrity failure, NOT an insufficient-evidence condition.
     The message does NOT contain raw bytes, transcript plaintext, or private paths.
     Exit code: EXIT_CONTENT_INTEGRITY_ERROR (9).
+    """
+
+
+class CacheSchemaValidationError(ValueError):
+    """Raised when a cached analysis fails full Draft 2020-12 schema validation.
+
+    This is a configuration failure (missing schema file or jsonschema package),
+    not a cache miss. The pipeline must not continue with an unvalidated cache hit.
     """
 
 
@@ -170,6 +178,47 @@ class ClipAnalysis:
     provenance: dict[str, Any]
 
 
+# ── Provider Content (Explicit Binding) ───────────────────────────────────────
+
+@dataclass(frozen=True)
+class ProviderImageContent:
+    """Immutable, explicitly-bound raw image record for one keyframe slot.
+
+    Each instance binds raw JPEG bytes to an exact (order, frame_id) pair
+    that matches the corresponding image descriptor in SceneVisionSemanticRequest.
+
+    Fields
+    ------
+    order     : Zero-based canonical position index. Must equal position in bundle.
+    frame_id  : Unique, non-empty string matching semantic_request.images[order].frame_id.
+    image_bytes: Raw JPEG bytes. Not serialized, not logged, not stored in cache.
+    """
+    order: int
+    frame_id: str
+    image_bytes: bytes = field(repr=False)
+
+
+@dataclass(frozen=True)
+class ProviderContentBundle:
+    """Non-serializable in-memory content payload for provider construction.
+
+    NOT part of cache identity. MUST be built from verified semantic request
+    fields. The images tuple is in the same canonical order as
+    semantic_request.images (images[i].order == i, frame_id matches descriptor).
+
+    IMMUTABLE: frozen dataclass with tuple[ProviderImageContent, ...].
+    This object is never serialized, logged, or stored in cache.
+
+    Explicit binding contract:
+    - Each ProviderImageContent carries its own (order, frame_id) — never
+      matched by tuple position alone.
+    - validate_content_bundle_against_semantic_request() verifies every
+      (order, frame_id) pair is present, unique, and matches its descriptor.
+    """
+    images: tuple[ProviderImageContent, ...]
+    transcript_excerpt: str | None = field(default=None, repr=False)
+
+
 # ── Semantic Request Abstraction (Phase 4 Final Contract) ─────────────────────
 
 @dataclass(frozen=True)
@@ -185,23 +234,27 @@ class SceneVisionSemanticRequest:
 
     Fields
     ------
-    source_sha256       : SHA-256 of the source media file (64 hex chars, normalized lowercase)
-    provider_id         : "mock" | "openai"
-    requested_model_id  : model name or "" for mock
-    adapter_version     : "1.3.0"
-    prompt              : {"version": str, "content_sha256": str}
-    provider_options    : non-secret options affecting the response
-    scene               : {"scene_id": int, "start_us": int, "end_us": int, "duration_us": int}
-    profile             : {"profile_id": str, "resolved_profile_sha256": str,
-                           "ordered_criteria": [{"order": int, "criterion_id": str, "finite_weight": float}]}
-    images              : ordered tuple of {"order": int, "frame_id": str, "full_sha256": str,
-                           "mime_type": str, "width": int, "height": int, "detail": str}
-    transcript_context  : {"mode": str, "character_count": int, "content_sha256": str}
-                          mode: "not_included" | "included" | "redacted"
-                          content_sha256: SHA-256 of exact UTF-8 excerpt or "not_included"
-    response_schema     : {"schema_version": str, "full_schema_sha256": str}
+    source_sha256               : SHA-256 of the source media file (64 hex chars, normalized lowercase)
+    preprocessing_identity_sha256: SHA-256 of the canonical Level-A preprocessing identity
+                                   (64 hex chars, normalized lowercase). Eliminates external
+                                   preprocessing_sha256 parameter from job-ID computation.
+    provider_id                 : "mock" | "openai"
+    requested_model_id          : model name or "" for mock
+    adapter_version             : "1.4.0"
+    prompt                      : {"version": str, "content_sha256": str}
+    provider_options            : non-secret options affecting the response
+    scene                       : {"scene_id": int, "start_us": int, "end_us": int, "duration_us": int}
+    profile                     : {"profile_id": str, "resolved_profile_sha256": str,
+                                   "ordered_criteria": [{"order": int, "criterion_id": str, "finite_weight": float}]}
+    images                      : ordered tuple of {"order": int, "frame_id": str, "full_sha256": str,
+                                   "mime_type": str, "width": int, "height": int, "detail": str}
+    transcript_context          : {"mode": str, "character_count": int, "content_sha256": str}
+                                  mode: "not_included" | "included" | "redacted"
+                                  content_sha256: SHA-256 of exact UTF-8 excerpt or "not_included"
+    response_schema             : {"schema_version": str, "full_schema_sha256": str}
     """
     source_sha256: str
+    preprocessing_identity_sha256: str
     provider_id: str
     requested_model_id: str
     adapter_version: str
@@ -219,16 +272,23 @@ class SceneVisionSemanticRequest:
                 f"source_sha256 must be exactly 64 lowercase hexadecimal characters; "
                 f"got {len(self.source_sha256)!r} characters"
             )
+        if not _is_valid_sha256(self.preprocessing_identity_sha256):
+            raise ValueError(
+                f"preprocessing_identity_sha256 must be exactly 64 hexadecimal characters; "
+                f"got {len(self.preprocessing_identity_sha256)!r} characters"
+            )
 
     def to_canonical_identity_dict(self) -> dict:
         """Return a deterministic, JSON-serializable dict for cache hashing.
 
         The returned dict contains only primitive types (str, int, float, bool,
         None, list, dict). It is safe to pass to json.dumps(sort_keys=True).
-        source_sha256 is always lowercased for canonical normalization.
+        source_sha256 and preprocessing_identity_sha256 are always lowercased
+        for canonical normalization.
         """
         return {
             "source_sha256": self.source_sha256.lower(),
+            "preprocessing_identity_sha256": self.preprocessing_identity_sha256.lower(),
             "provider_id": self.provider_id,
             "requested_model_id": self.requested_model_id,
             "adapter_version": self.adapter_version,
@@ -253,21 +313,6 @@ class SceneVisionSemanticRequest:
             ensure_ascii=False, allow_nan=False,
         ).encode("utf-8")
         return hashlib.sha256(canonical).hexdigest()
-
-
-@dataclass(frozen=True)
-class ProviderContentBundle:
-    """Non-serializable in-memory content payload for provider construction.
-
-    NOT part of cache identity. MUST be built from verified semantic request
-    fields. The image_bytes tuple is in the same order as semantic_request.images.
-    transcript_excerpt is the raw UTF-8 text if mode=="included", else None.
-
-    IMMUTABLE: frozen dataclass with tuple[bytes, ...] (not list).
-    This object is never serialized, logged, or stored in cache.
-    """
-    image_bytes: tuple[bytes, ...]   # raw JPEG bytes; order matches semantic_request.images
-    transcript_excerpt: str | None   # raw UTF-8 text or None if not included
 
 
 # ── Content bundle validation ─────────────────────────────────────────────────
@@ -301,69 +346,115 @@ def validate_content_bundle_against_semantic_request(
 ) -> None:
     """Validate that content_bundle matches semantic_request exactly.
 
+    Uses explicit (order, frame_id) binding — NOT positional zip matching.
+    Every semantic descriptor is mapped to exactly one ProviderImageContent
+    record by its (order, frame_id) pair.
+
     Verifies ALL of the following (raises ProviderContentIntegrityError on any):
-    1. Image count matches descriptor count.
-    2. Each image SHA-256 matches its descriptor.
-    3. Each image MIME magic matches its descriptor.
-    4. Each image JPEG dimensions match its descriptor (where parseable).
-    5. Frame order/ID preserved (order == index in sequence).
-    6. Transcript consent mode and hash consistency.
-    7. Character count matches when transcript is included.
+    1. Bundle images are in canonical order (images[i].order == i, contiguous 0..n-1).
+    2. All frame_id values in the bundle are unique and non-empty.
+    3. All (order, frame_id) pairs in the bundle are unique.
+    4. Image count matches descriptor count.
+    5. Each descriptor (order, frame_id) has exactly one matching bundle record.
+    6. Each image SHA-256 matches its descriptor.
+    7. Each image MIME magic matches its descriptor.
+    8. Each image JPEG dimensions match its descriptor (where parseable).
+    9. Transcript consent mode and hash consistency.
+    10. Character count matches when transcript is included.
 
     Does NOT disclose raw bytes or transcript text in exception messages.
     This function is called at Point A (before cache lookup) and
     Point B (before provider invocation on cache miss).
     """
+    images = content_bundle.images
     descriptors = semantic_request.images
-    bundle_bytes = content_bundle.image_bytes
 
-    # 1. Count check
-    if len(bundle_bytes) != len(descriptors):
-        raise ProviderContentIntegrityError(
-            f"Image count mismatch: semantic descriptor has {len(descriptors)} image(s), "
-            f"content bundle has {len(bundle_bytes)} image(s)"
-        )
+    # ── Bundle self-consistency checks ───────────────────────────────────────
 
-    for idx, (desc, raw) in enumerate(zip(descriptors, bundle_bytes)):
-        # 5. Order/frame_id check (descriptor.order must equal position index)
-        if desc.get("order") != idx:
+    # 1. Canonical order: images[i].order must equal i, contiguous 0..n-1
+    for i, pic in enumerate(images):
+        if pic.order != i:
             raise ProviderContentIntegrityError(
-                f"Frame order mismatch at bundle position {idx}: "
-                f"descriptor order={desc.get('order')!r}"
+                f"Bundle images are not in canonical order: "
+                f"images[{i}].order == {pic.order!r}, expected {i}"
             )
 
-        # 2. SHA-256 check
-        actual_sha = hashlib.sha256(raw).hexdigest()
+    # 2. frame_id must be non-empty
+    for pic in images:
+        if not pic.frame_id:
+            raise ProviderContentIntegrityError(
+                f"Bundle image at order={pic.order} has an empty frame_id"
+            )
+
+    # 3. (order, frame_id) uniqueness
+    seen_keys: set[tuple[int, str]] = set()
+    for pic in images:
+        key = (pic.order, pic.frame_id)
+        if key in seen_keys:
+            raise ProviderContentIntegrityError(
+                f"Duplicate (order, frame_id) in bundle: order={pic.order}, "
+                f"frame_id={pic.frame_id!r}"
+            )
+        seen_keys.add(key)
+
+    # ── Build (order, frame_id) → ProviderImageContent lookup ────────────────
+    bundle_lookup: dict[tuple[int, str], ProviderImageContent] = {
+        (pic.order, pic.frame_id): pic for pic in images
+    }
+
+    # 4. Count check
+    if len(images) != len(descriptors):
+        raise ProviderContentIntegrityError(
+            f"Image count mismatch: semantic descriptor has {len(descriptors)} image(s), "
+            f"content bundle has {len(images)} image(s)"
+        )
+
+    # 5–8. Per-descriptor validation using explicit (order, frame_id) lookup
+    for idx, desc in enumerate(descriptors):
+        desc_order = desc.get("order")
+        desc_frame_id = desc.get("frame_id", "")
+        key = (desc_order, desc_frame_id)
+
+        # 5. Explicit binding: find matching bundle record
+        if key not in bundle_lookup:
+            raise ProviderContentIntegrityError(
+                f"No bundle record for descriptor at position {idx}: "
+                f"(order={desc_order!r}, frame_id={desc_frame_id!r})"
+            )
+        pic = bundle_lookup[key]
+
+        # 6. SHA-256 check
+        actual_sha = hashlib.sha256(pic.image_bytes).hexdigest()
         expected_sha = desc.get("full_sha256", "")
         if actual_sha.lower() != expected_sha.lower():
             raise ProviderContentIntegrityError(
-                f"Image SHA-256 mismatch at index {idx} "
-                f"(order={desc.get('order')}, frame_id={desc.get('frame_id')!r}): "
+                f"Image SHA-256 mismatch at descriptor position {idx} "
+                f"(order={desc_order}, frame_id={desc_frame_id!r}): "
                 f"expected suffix ...{expected_sha[-12:]}, got ...{actual_sha[-12:]}"
             )
 
-        # 3. MIME magic check
+        # 7. MIME magic check
         mime = desc.get("mime_type", "")
-        is_jpeg = len(raw) >= 2 and raw[:2] == b'\xff\xd8'
+        is_jpeg = len(pic.image_bytes) >= 2 and pic.image_bytes[:2] == b'\xff\xd8'
         if mime == "image/jpeg" and not is_jpeg:
             raise ProviderContentIntegrityError(
-                f"MIME mismatch at index {idx}: descriptor declares image/jpeg "
+                f"MIME mismatch at descriptor position {idx}: descriptor declares image/jpeg "
                 f"but bytes do not start with JPEG magic (FF D8)"
             )
 
-        # 4. JPEG dimension check (only when parseable and mime is JPEG)
+        # 8. JPEG dimension check (only when parseable and mime is JPEG)
         if mime == "image/jpeg" and is_jpeg:
-            dims = _read_jpeg_dimensions(raw)
+            dims = _read_jpeg_dimensions(pic.image_bytes)
             if dims is not None:
                 exp_w = desc.get("width", -1)
                 exp_h = desc.get("height", -1)
                 if dims[0] != exp_w or dims[1] != exp_h:
                     raise ProviderContentIntegrityError(
-                        f"JPEG dimension mismatch at index {idx}: "
+                        f"JPEG dimension mismatch at descriptor position {idx}: "
                         f"descriptor says {exp_w}x{exp_h}, parsed {dims[0]}x{dims[1]}"
                     )
 
-    # 6 & 7. Transcript consent and hash verification
+    # 9 & 10. Transcript consent and hash verification
     tc = semantic_request.transcript_context
     mode = tc.get("mode", "not_included")
     excerpt = content_bundle.transcript_excerpt
